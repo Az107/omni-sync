@@ -175,6 +175,7 @@ mod tests {
             pubkey: vec![],
             token_hash: vec![token_hash; 32],
             revoked: false,
+            last_seen_at: None,
         }
     }
 

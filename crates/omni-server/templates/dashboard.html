@@ -9,7 +9,12 @@
 <body>
   <header class="bar">
     <span class="brand">omni-sync</span>
-    <nav><a href="/">overview</a></nav>
+    <nav>
+      <a href="/">overview</a>
+      <a href="/devices">devices</a>
+      <a href="/folders">folders</a>
+      <a href="/overwrites">overwrites</a>
+    </nav>
     <form method="post" action="/logout"><button type="submit">log out</button></form>
   </header>
 
@@ -18,20 +23,10 @@
     <p class="muted">server {{ version }}</p>
 
     <div class="cards">
-      <section class="card">
-        <h2>{{ devices }}</h2>
-        <p>devices enrolled</p>
-      </section>
-      <section class="card">
-        <h2>{{ folders }}</h2>
-        <p>shared folders</p>
-      </section>
+      <section class="card"><h2>{{ devices }}</h2><p>devices enrolled</p></section>
+      <section class="card"><h2>{{ folders }}</h2><p>shared folders</p></section>
+      <section class="card"><h2>{{ overwrites }}</h2><p>open overwrites</p></section>
     </div>
-
-    <p class="muted">
-      M0 scaffold: enrollment is live. Folders, file history and the overwrite
-      queue land in M2–M4.
-    </p>
   </main>
 </body>
 </html>

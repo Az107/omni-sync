@@ -7,16 +7,18 @@ Traefik + Let's Encrypt, systemd user unit).
 
 ## Status (2026-10-10)
 
-**M0–M3 done — the MVP syncs.** A server and two daemons were run against
-each other: create (a text and a binary file, byte-identical on both
-sides), bidirectional edit, delete propagation, and an offline edit on
-both devices yielding exactly one overwrite row with last-write-wins
-converging both sides. 46 tests, clippy clean. See `AGENTS.md` for entry
-points, the smoke test and the two-client verification recipe.
+**M0–M4 done — the MVP syncs and is manageable.** A server and two
+daemons were run against each other: create (a text and a binary file,
+byte-identical on both sides), bidirectional edit, delete propagation,
+and an offline edit on both devices yielding exactly one overwrite row
+with last-write-wins converging both sides. The dashboard then restored
+the superseded version and both sides converged again. 47 tests, clippy
+clean. See `AGENTS.md` for entry points, the smoke test and the
+two-client verification recipe.
 
-Still open: **M4** (dashboard pages for devices, folders and overwrites)
-and **M5** (conflict/history views, resolve/flush commands, chunk GC,
-`notify`-driven wakeup, membership enforcement, deploy).
+Still open: **M5** (client `history`/`resolve`/`flush` commands, chunk
+GC, membership enforcement, `notify`-driven wakeup, TLS deploy to the
+VPS).
 
 ## Answers folded in (2026-10-10)
 

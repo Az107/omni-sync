@@ -22,7 +22,9 @@ use omni_store::{StoreError, devices, folders, pairing};
 use crate::auth;
 use crate::chunkstore::ChunkError;
 use crate::state::AppState;
-use crate::templates::{Dashboard, Login};
+use crate::templates::{
+    Dashboard, DeviceView, Devices, FolderView, Folders, Login, OverwriteView, Overwrites,
+};
 
 /// The dashboard session cookie name.
 pub const SESSION_COOKIE: &str = "omni_session";
@@ -40,6 +42,12 @@ pub fn router(state: AppState) -> Router {
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout))
         .route("/static/{*path}", get(static_asset))
+        // Dashboard pages.
+        .route("/devices", get(devices_page))
+        .route("/devices/pair", post(devices_pair))
+        .route("/folders", get(folders_page).post(folders_create))
+        .route("/overwrites", get(overwrites_page))
+        .route("/overwrites/{id}/resolve", post(overwrite_resolve))
         // Device enrollment.
         .route("/api/v1/devices/enroll", post(enroll))
         // Folders.
@@ -160,12 +168,201 @@ async fn dashboard(
     }
     let devices = state.store.blocking(devices::count).await?;
     let folders = state.store.blocking(folders::count).await?;
+    let overwrites = state
+        .store
+        .blocking(|conn| sync::overwrites(conn, true))
+        .await?
+        .len() as i64;
     let page = Dashboard {
         version: env!("CARGO_PKG_VERSION").to_string(),
         devices,
         folders,
+        overwrites,
     };
     Ok(Html(page.render()?).into_response())
+}
+
+#[derive(Deserialize)]
+struct CodeQuery {
+    #[serde(default)]
+    code: Option<String>,
+}
+
+async fn devices_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CodeQuery>,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let devices = state.store.blocking(devices::list).await?;
+    let page = Devices {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        devices: devices
+            .into_iter()
+            .map(|device| DeviceView {
+                name: device.name,
+                id: device.id,
+                last_seen: device.last_seen_at.unwrap_or_else(|| "never".to_string()),
+                revoked: device.revoked,
+            })
+            .collect(),
+        code: query.code,
+    };
+    Ok(Html(page.render()?).into_response())
+}
+
+async fn devices_pair(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let code = auth::new_pairing_code();
+    let created = code.clone();
+    state
+        .store
+        .blocking(move |conn| pairing::create(conn, &created, 600))
+        .await?;
+    Ok(Redirect::to(&format!("/devices?code={code}")).into_response())
+}
+
+async fn folders_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let folders = state.store.blocking(folders::list).await?;
+    let page = Folders {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        folders: folders
+            .into_iter()
+            .map(|folder| FolderView {
+                id: folder.id,
+                name: folder.name,
+            })
+            .collect(),
+    };
+    Ok(Html(page.render()?).into_response())
+}
+
+#[derive(Deserialize)]
+struct CreateFolderForm {
+    name: String,
+}
+
+async fn folders_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CreateFolderForm>,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let name = form.name.trim();
+    if !name.is_empty() {
+        let folder = folders::Folder {
+            id: uuid::Uuid::now_v7().to_string(),
+            name: name.to_string(),
+            retention_versions: 50,
+            retention_days: 90,
+            encrypted: false,
+        };
+        state
+            .store
+            .blocking(move |conn| folders::create(conn, &folder))
+            .await?;
+    }
+    Ok(Redirect::to("/folders").into_response())
+}
+
+async fn overwrites_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let rows = state
+        .store
+        .blocking(|conn| sync::overwrites(conn, true))
+        .await?;
+    let folders = state.store.blocking(folders::list).await?;
+    let names: std::collections::HashMap<String, String> = folders
+        .into_iter()
+        .map(|folder| (folder.id, folder.name))
+        .collect();
+
+    let page = Overwrites {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        rows: rows
+            .into_iter()
+            .map(|row| OverwriteView {
+                id: row.id,
+                folder: names
+                    .get(&row.folder_id)
+                    .cloned()
+                    .unwrap_or_else(|| row.folder_id.clone()),
+                path: display_path(&row.path),
+                losing_version: row.losing_version_id,
+                winning_version: row.winning_version_id,
+            })
+            .collect(),
+    };
+    Ok(Html(page.render()?).into_response())
+}
+
+async fn overwrite_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let row = state
+        .store
+        .blocking(move |conn| sync::overwrite(conn, id))
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // Restore the superseded version's content at the same path.
+    let losing = row.losing_version_id;
+    let version = state
+        .store
+        .blocking(move |conn| sync::version(conn, losing))
+        .await?
+        .ok_or_else(|| AppError::BadRequest(format!("unknown version {losing}")))?;
+
+    let folder = row.folder_id.clone();
+    let lookup = row.path.clone();
+    let active = state
+        .store
+        .blocking(move |conn| sync::active_version_id(conn, &folder, &lookup))
+        .await?;
+
+    let op = Op {
+        base_seq: 0,
+        base_version_id: active,
+        kind: OpKind::Resolve,
+        path: row.path.clone(),
+        from: None,
+        size: version.size,
+        mtime_ns: version.mtime_ns,
+        mode: version.mode,
+        chunks: version.chunks,
+        restored_from: Some(version.id),
+    };
+    state.apply(&row.folder_id, "dashboard", op).await?;
+    state
+        .store
+        .blocking(move |conn| sync::mark_overwrite_resolved(conn, id))
+        .await?;
+    Ok(Redirect::to("/overwrites").into_response())
 }
 
 async fn login_form(headers: HeaderMap) -> Result<Html<String>, AppError> {
@@ -248,6 +445,7 @@ async fn enroll(
         pubkey: Vec::new(),
         token_hash: auth::hash_token(&token),
         revoked: false,
+        last_seen_at: None,
     };
     let code = request.code;
 
@@ -555,6 +753,12 @@ fn overwrite_dto(row: OverwriteRow) -> OverwriteDto {
 
 // ---- helpers ---------------------------------------------------------------
 
+/// Render raw path bytes for display. Lossy on purpose: this is a web page, not
+/// the sync path, and a replacement character is honest about undecodable names.
+fn display_path(path: &[u8]) -> String {
+    String::from_utf8_lossy(path).into_owned()
+}
+
 fn login_page(error: Option<&str>, next: &str, _headers: &HeaderMap) -> Result<String, AppError> {
     let page = Login {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -623,5 +827,12 @@ mod tests {
         let mut empty = HeaderMap::new();
         empty.insert(header::AUTHORIZATION, HeaderValue::from_static("Basic x"));
         assert_eq!(bearer(&empty), None);
+    }
+
+    #[test]
+    fn display_path_is_lossy_but_never_panics() {
+        assert_eq!(display_path(b"notes/todo.md"), "notes/todo.md");
+        // A non-UTF-8 byte becomes the replacement character, not an error.
+        assert!(display_path(&[0xff, b'a']).ends_with('a'));
     }
 }

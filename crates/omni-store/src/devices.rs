@@ -14,6 +14,18 @@ pub struct Device {
     /// SHA-256 of the bearer token. The token itself is never stored.
     pub token_hash: Vec<u8>,
     pub revoked: bool,
+    pub last_seen_at: Option<String>,
+}
+
+fn row_to_device(row: &rusqlite::Row<'_>) -> rusqlite::Result<Device> {
+    Ok(Device {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        pubkey: row.get(2)?,
+        token_hash: row.get(3)?,
+        revoked: row.get(4)?,
+        last_seen_at: row.get(5)?,
+    })
 }
 
 pub fn insert(conn: &Connection, device: &Device) -> Result<(), StoreError> {
@@ -26,19 +38,11 @@ pub fn insert(conn: &Connection, device: &Device) -> Result<(), StoreError> {
 
 pub fn by_token_hash(conn: &Connection, token_hash: &[u8]) -> Result<Option<Device>, StoreError> {
     conn.query_row(
-        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL
+        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL, last_seen_at
            FROM devices
           WHERE token_hash = ?1",
         [token_hash],
-        |row| {
-            Ok(Device {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                pubkey: row.get(2)?,
-                token_hash: row.get(3)?,
-                revoked: row.get(4)?,
-            })
-        },
+        row_to_device,
     )
     .optional()
     .map_err(StoreError::from)
@@ -46,18 +50,10 @@ pub fn by_token_hash(conn: &Connection, token_hash: &[u8]) -> Result<Option<Devi
 
 pub fn get(conn: &Connection, id: &str) -> Result<Option<Device>, StoreError> {
     conn.query_row(
-        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL
+        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL, last_seen_at
            FROM devices WHERE id = ?1",
         [id],
-        |row| {
-            Ok(Device {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                pubkey: row.get(2)?,
-                token_hash: row.get(3)?,
-                revoked: row.get(4)?,
-            })
-        },
+        row_to_device,
     )
     .optional()
     .map_err(StoreError::from)
@@ -65,18 +61,10 @@ pub fn get(conn: &Connection, id: &str) -> Result<Option<Device>, StoreError> {
 
 pub fn list(conn: &Connection) -> Result<Vec<Device>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL
+        "SELECT id, name, pubkey, token_hash, revoked_at IS NOT NULL, last_seen_at
            FROM devices ORDER BY enrolled_at",
     )?;
-    let rows = stmt.query_map([], |row| {
-        Ok(Device {
-            id: row.get(0)?,
-            name: row.get(1)?,
-            pubkey: row.get(2)?,
-            token_hash: row.get(3)?,
-            revoked: row.get(4)?,
-        })
-    })?;
+    let rows = stmt.query_map([], row_to_device)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row?);

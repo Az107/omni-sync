@@ -348,6 +348,38 @@ pub fn active_version_id(
         .flatten())
 }
 
+/// One overwrite review row by id.
+pub fn overwrite(conn: &Connection, id: i64) -> Result<Option<OverwriteRow>, StoreError> {
+    conn.query_row(
+        "SELECT id, folder_id, path, losing_version_id, winning_version_id, resolved_at
+           FROM overwrites WHERE id = ?1",
+        [id],
+        |row| {
+            Ok(OverwriteRow {
+                id: row.get(0)?,
+                folder_id: row.get(1)?,
+                path: row.get(2)?,
+                losing_version_id: row.get(3)?,
+                winning_version_id: row.get(4)?,
+                resolved: row.get::<_, Option<String>>(5)?.is_some(),
+            })
+        },
+    )
+    .optional()
+    .map_err(StoreError::from)
+}
+
+/// Mark an overwrite review row resolved (after a restore).
+pub fn mark_overwrite_resolved(conn: &Connection, id: i64) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE overwrites
+            SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          WHERE id = ?1 AND resolved_at IS NULL",
+        [id],
+    )?;
+    Ok(())
+}
+
 /// The overwrite review queue, newest first.
 pub fn overwrites(conn: &Connection, open_only: bool) -> Result<Vec<OverwriteRow>, StoreError> {
     let sql = if open_only {

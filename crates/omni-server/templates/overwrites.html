@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>omni-sync · overwrites</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">omni-sync</span>
+    <nav>
+      <a href="/">overview</a>
+      <a href="/devices">devices</a>
+      <a href="/folders">folders</a>
+      <a href="/overwrites">overwrites</a>
+    </nav>
+    <form method="post" action="/logout"><button type="submit">log out</button></form>
+  </header>
+
+  <main>
+    <h1>Overwrites</h1>
+    <p class="muted">
+      Last-write-wins kept the newer version. The older version is still stored,
+      so <em>restore older</em> puts it back on every device.
+    </p>
+
+    {% if rows.is_empty() %}
+      <p>Nothing to review.</p>
+    {% else %}
+      <table>
+        <thead><tr><th>path</th><th>folder</th><th>kept</th><th>superseded</th><th></th></tr></thead>
+        <tbody>
+        {% for row in rows %}
+          <tr>
+            <td class="mono">{{ row.path }}</td>
+            <td class="mono">{{ row.folder }}</td>
+            <td>v{{ row.winning_version }}</td>
+            <td>v{{ row.losing_version }}</td>
+            <td>
+              <form method="post" action="/overwrites/{{ row.id }}/resolve">
+                <button type="submit">restore older</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% endif %}
+  </main>
+</body>
+</html>

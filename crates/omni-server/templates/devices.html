@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>omni-sync · devices</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">omni-sync</span>
+    <nav>
+      <a href="/">overview</a>
+      <a href="/devices">devices</a>
+      <a href="/folders">folders</a>
+      <a href="/overwrites">overwrites</a>
+    </nav>
+    <form method="post" action="/logout"><button type="submit">log out</button></form>
+  </header>
+
+  <main>
+    <h1>Devices</h1>
+
+    <form method="post" action="/devices/pair">
+      <button type="submit">Add a device</button>
+    </form>
+
+    {% if let Some(code) = code %}
+      <p class="notice">
+        Pairing code <strong>{{ code }}</strong> (valid 10 minutes). Enroll with:<br>
+        <code>omni-sync enroll --server &lt;url&gt; --code {{ code }}</code>
+      </p>
+    {% endif %}
+
+    <table>
+      <thead><tr><th>name</th><th>id</th><th>last seen</th><th>state</th></tr></thead>
+      <tbody>
+      {% for device in devices %}
+        <tr>
+          <td>{{ device.name }}</td>
+          <td class="mono">{{ device.id }}</td>
+          <td>{{ device.last_seen }}</td>
+          <td>{% if device.revoked %}revoked{% else %}active{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

@@ -18,23 +18,26 @@ One Rust workspace, several crates, two binaries.
 
 ## Status
 
-**M0–M3 are done; the MVP syncs.** A server and two client daemons were
-run against each other and the following held: a create (including a
-binary file, byte-identical on both sides), an edit propagating both
-ways within ~2 s, a delete propagating, and an offline edit on both
-devices producing exactly one overwrite row with last-write-wins
-converging both devices on the same content. 46 tests, clippy clean.
+**M0–M4 are done; the MVP syncs and is manageable.** A server and two
+client daemons were run against each other and the following held: a
+create (including a binary file, byte-identical on both sides), an edit
+propagating both ways within ~2 s, a delete propagating, and an offline
+edit on both devices producing exactly one overwrite row with
+last-write-wins converging both devices on the same content. The
+dashboard was then used to *restore older* on that overwrite, and both
+devices converged on the superseded content with the queue cleared. 47
+tests, clippy clean.
 
 What exists: the whole pure core (`omni-core`, `omni-chunk`), the wire
-contract, both SQLite schemas, the server with its `/api/v1` surface and
-chunk store, and the client engine (`omni-agent::Engine`) that scans,
-pushes ops+chunks and applies the pulled log.
+contract, both SQLite schemas, the server with its `/api/v1` surface,
+chunk store and dashboard (overview, devices + pairing codes, folders,
+overwrites + resolve), and the client engine (`omni-agent::Engine`) that
+scans, pushes ops+chunks and applies the pulled log.
 
-**M4 (dashboard pages) and M5 (hardening) are not built.** The dashboard
-is one overview page; `history`, `resolve` and `flush` still print their
-milestone; there is no chunk GC, no per-folder membership enforcement and
-no `notify`-driven wakeup (the engine polls every second, which is enough
-for now). See "Known gaps".
+**M5 (hardening) is not built.** `history`, `resolve` and `flush` client
+subcommands still print their milestone; there is no chunk GC, no
+per-folder membership enforcement and no `notify`-driven wakeup (the
+engine polls every second, which is enough for now). See "Known gaps".
 
 ## Commands
 
@@ -164,14 +167,17 @@ twice returns `400 invalid, expired or already-used pairing code`.
   delete + put at the client. The op kind exists in the schema.
 - **Per-folder membership is not enforced.** Any enrolled device may read
   or write any folder. `members` exists but is unused.
+- The dashboard covers overview, devices (with pairing codes), folders
+  and overwrites (with *restore older*). It is plain form posts, no HTMX
+  yet, and there is no per-file history view.
 - **No chunk refcount GC.** `chunks.refs` is maintained on write; nothing
   reclaims unreferenced chunks yet.
 - **`notify` is not wired into the engine.** The watcher exists
   (`omni_agent::watch`); the loop polls every second instead.
 - **`omni_agent::held()` always returns `None`.** On-close/live modes are
   modelled (`SyncMode`, `HoldRule`) but holder detection is not built.
-- The dashboard is one overview page. No devices/folders/overwrites
-  pages, no HTMX interactions.
+- The dashboard is plain form posts (no HTMX yet): overview, devices
+  with pairing codes, folders, and overwrites with *restore older*.
 - `omni-core`'s `Op`/`Version` and `omni-netproto`'s DTOs are deliberately
   separate types, bridged by `omni-netproto::convert`.
 
