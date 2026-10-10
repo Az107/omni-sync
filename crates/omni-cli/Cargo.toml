@@ -1,0 +1,22 @@
+[package]
+name = "omni-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The omni-sync client CLI and daemon"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+directories.workspace = true
+omni-netproto.workspace = true
+omni-transfer.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+
+[[bin]]
+name = "omni-sync"
+path = "src/main.rs"

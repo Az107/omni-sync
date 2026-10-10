@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>omni-sync · log in</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="centered">
+  <form class="login" method="post" action="/login">
+    <h1>omni-sync</h1>
+    <p class="muted">server {{ version }}</p>
+    {% if let Some(message) = error %}
+      <p class="error">{{ message }}</p>
+    {% endif %}
+    <label for="password">dashboard password</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+    <input type="hidden" name="next" value="{{ next }}">
+    <button type="submit">log in</button>
+  </form>
+</body>
+</html>

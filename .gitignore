@@ -1,0 +1,11 @@
+# Build output
+/target
+
+# Local state and databases
+*.db
+*.db-wal
+*.db-shm
+
+# Local config/credentials that must never be committed
+client.toml
+server.toml

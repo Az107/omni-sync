@@ -1,0 +1,18 @@
+[package]
+name = "omni-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQLite storage for omni-sync: forward-only migrations and the blocking seam"
+
+[dependencies]
+omni-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

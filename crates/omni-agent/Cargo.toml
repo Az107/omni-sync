@@ -1,0 +1,13 @@
+[package]
+name = "omni-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The omni-sync client daemon: watcher, holds and apply"
+
+[dependencies]
+notify.workspace = true
+omni-chunk.workspace = true
+tokio.workspace = true

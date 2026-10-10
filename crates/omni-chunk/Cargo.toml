@@ -1,0 +1,12 @@
+[package]
+name = "omni-chunk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-defined chunking (gear-hash FastCDC) for omni-sync"
+
+[dependencies]
+# Intentionally empty: the chunker is pure and hashing lives at the call site
+# (omni-agent / omni-server), so this crate stays trivially testable.
