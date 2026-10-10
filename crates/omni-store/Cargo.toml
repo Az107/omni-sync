@@ -10,6 +10,7 @@ description = "SQLite storage for omni-sync: forward-only migrations and the blo
 [dependencies]
 omni-core.workspace = true
 rusqlite.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

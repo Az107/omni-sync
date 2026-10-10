@@ -8,6 +8,6 @@ repository.workspace = true
 description = "Pure sync semantics for omni-sync: ops, versions and the last-write-wins rule"
 
 [dependencies]
-# Intentionally empty. This crate is the testable core and must stay free of
-# I/O, async runtimes, databases and network stacks. Push anything that touches
-# the outside world into omni-store, omni-transfer, omni-agent or omni-server.
+# serde only: these are plain value types. Still no I/O, no runtime, no
+# database, no network — the point is that the rules stay testable in isolation.
+serde.workspace = true

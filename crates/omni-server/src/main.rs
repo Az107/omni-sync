@@ -8,7 +8,7 @@ use omni_server::app;
 use omni_server::auth;
 use omni_server::config::Config;
 use omni_server::state::AppState;
-use omni_store::{Store, devices, pairing};
+use omni_store::{Store, devices, folders, pairing};
 
 #[derive(Parser)]
 #[command(
@@ -41,8 +41,21 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         ttl: i64,
     },
+    /// Manage shared folders from the command line.
+    Folder {
+        #[command(subcommand)]
+        action: FolderAction,
+    },
     /// Print the resolved config and database status.
     Doctor,
+}
+
+#[derive(Subcommand)]
+enum FolderAction {
+    /// Create a folder and print its id.
+    Create { name: String },
+    /// List folders (id and name).
+    List,
 }
 
 #[tokio::main]
@@ -59,8 +72,36 @@ async fn main() -> anyhow::Result<()> {
         Command::Init => init(cli.config.as_deref()),
         Command::Serve { addr } => serve(cli.config.as_deref(), addr).await,
         Command::Pair { ttl } => pair(cli.config.as_deref(), ttl),
+        Command::Folder { action } => folder(cli.config.as_deref(), action),
         Command::Doctor => doctor(cli.config.as_deref()),
     }
+}
+
+fn folder(explicit: Option<&std::path::Path>, action: FolderAction) -> anyhow::Result<()> {
+    let config = Config::load(explicit)?;
+    std::fs::create_dir_all(&config.state_dir)?;
+    let store = Store::open(&config.db_path())
+        .with_context(|| format!("opening {}", config.db_path().display()))?;
+    match action {
+        FolderAction::Create { name } => {
+            let folder = folders::Folder {
+                id: uuid::Uuid::now_v7().to_string(),
+                name,
+                retention_versions: 50,
+                retention_days: 90,
+                encrypted: false,
+            };
+            let id = folder.id.clone();
+            store.with(|conn| folders::create(conn, &folder))?;
+            println!("{id}");
+        }
+        FolderAction::List => {
+            for folder in store.with(folders::list)? {
+                println!("{}  {}", folder.id, folder.name);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn pair(explicit: Option<&std::path::Path>, ttl: i64) -> anyhow::Result<()> {

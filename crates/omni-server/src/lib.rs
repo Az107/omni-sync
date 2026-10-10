@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod chunkstore;
 pub mod config;
 pub mod state;
 pub mod templates;

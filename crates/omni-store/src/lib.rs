@@ -6,10 +6,12 @@
 //!
 //! Migrations are the forward-only list in [`migrations::MIGRATIONS`].
 
+pub mod agent;
 pub mod devices;
 pub mod folders;
 pub mod migrations;
 pub mod pairing;
+pub mod sync;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -28,6 +30,10 @@ pub enum StoreError {
     Join(#[from] tokio::task::JoinError),
     #[error("store mutex poisoned")]
     Poisoned,
+    #[error("json: {0}")]
+    Json(String),
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// A handle to the database. Cloneable; all clones share one connection.
@@ -66,6 +72,37 @@ impl Store {
     pub fn migrate(&self) -> Result<(), StoreError> {
         let mut conn = self.db.lock().map_err(|_| StoreError::Poisoned)?;
         migrations::apply(&mut conn)
+    }
+
+    /// Open (or create) a client database, then migrate it.
+    pub fn open_agent(path: &Path) -> Result<Self, StoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        tune(&conn, true)?;
+        let store = Self {
+            db: Arc::new(Mutex::new(conn)),
+        };
+        store.migrate_agent()?;
+        Ok(store)
+    }
+
+    /// An in-memory client database, for tests.
+    pub fn open_agent_in_memory() -> Result<Self, StoreError> {
+        let conn = Connection::open_in_memory()?;
+        tune(&conn, false)?;
+        let store = Self {
+            db: Arc::new(Mutex::new(conn)),
+        };
+        store.migrate_agent()?;
+        Ok(store)
+    }
+
+    /// Apply pending client migrations.
+    pub fn migrate_agent(&self) -> Result<(), StoreError> {
+        let mut conn = self.db.lock().map_err(|_| StoreError::Poisoned)?;
+        migrations::apply_agent(&mut conn)
     }
 
     /// Run a blocking database closure off the async runtime.

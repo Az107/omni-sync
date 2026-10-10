@@ -1212,6 +1212,9 @@ dependencies = [
 [[package]]
 name = "omni-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "omni-netproto"
@@ -1234,6 +1237,8 @@ dependencies = [
  "clap",
  "directories",
  "hex",
+ "omni-chunk",
+ "omni-core",
  "omni-netproto",
  "omni-store",
  "rand 0.9.5",
@@ -1241,6 +1246,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror",
  "tokio",
  "toml",
@@ -1255,6 +1261,7 @@ version = "0.1.0"
 dependencies = [
  "omni-core",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

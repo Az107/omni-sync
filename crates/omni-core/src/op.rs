@@ -1,6 +1,7 @@
 //! The operation a client submits, and the pieces it references.
 
 use crate::version::PathBytes;
+use serde::{Deserialize, Serialize};
 
 /// A lowercase-hex SHA-256 of a chunk's bytes.
 pub type ChunkHash = String;
@@ -10,7 +11,7 @@ pub type ChunkHash = String;
 /// The offset is *not* stored: a file's chunks are ordered, and offset is the
 /// running sum of the lengths, so storing it would be a second source of truth
 /// for the same number.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkRef {
     pub hash: ChunkHash,
     pub len: u64,
@@ -26,7 +27,7 @@ impl ChunkRef {
 }
 
 /// What an op does to a path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OpKind {
     /// Create or replace the file at `path` with `chunks`.
     Put,
@@ -44,6 +45,9 @@ pub struct Op {
     /// The `applied_seq` the sender had when the change happened. The server
     /// compares this with the active version to detect an overwrite.
     pub base_seq: i64,
+    /// The active version id the sender had seen for this path, if any. This is
+    /// what the sequencer actually decides on.
+    pub base_version_id: Option<i64>,
     pub kind: OpKind,
     /// Destination path for `Put`/`Move`/`Resolve`; the removed path for `Delete`.
     pub path: PathBytes,

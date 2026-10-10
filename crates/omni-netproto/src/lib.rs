@@ -62,7 +62,10 @@ pub enum OpKindDto {
 /// One op as submitted. `path` and `from` are base64 of raw path bytes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpDto {
+    #[serde(default)]
     pub base_seq: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version_id: Option<i64>,
     pub kind: OpKindDto,
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,7 +84,6 @@ pub struct OpDto {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmitOpsRequest {
-    pub base_seq: i64,
     pub ops: Vec<OpDto>,
 }
 
@@ -92,6 +94,13 @@ pub struct SubmitOpsResponse {
     /// Overwrite review entries raised by this batch, if any.
     #[serde(default)]
     pub overwrites: Vec<OverwriteDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResolveRequest {
+    pub path: String,
+    /// The version whose content should become active again.
+    pub restored_from: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +131,8 @@ pub struct ManifestResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogEntryDto {
     pub seq: i64,
+    #[serde(default)]
+    pub version_id: i64,
     pub kind: OpKindDto,
     pub path: String,
     pub device_id: String,
@@ -138,6 +149,28 @@ pub struct LogEntryDto {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpsResponse {
     pub entries: Vec<LogEntryDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateFolderRequest {
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FolderDto {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FoldersResponse {
+    pub folders: Vec<FolderDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkPutResponse {
+    /// True when the bytes were newly stored, false when already present.
+    pub created: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

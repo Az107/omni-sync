@@ -62,6 +62,7 @@ impl OpDto {
     pub fn from_core(op: &Op) -> Self {
         Self {
             base_seq: op.base_seq,
+            base_version_id: op.base_version_id,
             kind: OpKindDto::from_core(op.kind),
             path: crate::encode_path(&op.path),
             from: op.from.as_deref().map(crate::encode_path),
@@ -81,6 +82,7 @@ impl OpDto {
         };
         Ok(Op {
             base_seq: self.base_seq,
+            base_version_id: self.base_version_id,
             kind: self.kind.to_core(),
             path: crate::decode_path(&self.path)?,
             from,
@@ -106,6 +108,7 @@ mod tests {
     fn a_core_op_round_trips_through_its_dto() {
         let op = Op {
             base_seq: 7,
+            base_version_id: Some(3),
             kind: OpKind::Put,
             path: b"notes/todo.md".to_vec(),
             from: None,

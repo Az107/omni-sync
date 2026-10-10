@@ -7,25 +7,45 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use omni_store::Store;
+use omni_core::Op;
+use omni_store::sync::{self, AppliedOp};
+use omni_store::{Store, StoreError};
 use rand::Rng as _;
 
+use crate::chunkstore::ChunkStore;
 use crate::config::Config;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
     pub config: Arc<Config>,
+    pub chunks: ChunkStore,
     sessions: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
     pub fn new(store: Store, config: Config) -> Self {
+        let chunks = ChunkStore::new(config.chunks_dir());
         Self {
             store,
             config: Arc::new(config),
+            chunks,
             sessions: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Apply one op on behalf of a device, off the async runtime.
+    pub async fn apply(
+        &self,
+        folder_id: &str,
+        device_id: &str,
+        op: Op,
+    ) -> Result<AppliedOp, StoreError> {
+        let folder_id = folder_id.to_string();
+        let device_id = device_id.to_string();
+        self.store
+            .blocking_mut(move |conn| sync::apply_op(conn, &folder_id, &device_id, &op))
+            .await
     }
 
     /// Create a session and return its handle.
