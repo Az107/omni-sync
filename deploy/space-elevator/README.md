@@ -1,99 +1,111 @@
 # Deploying the omni-sync server to space-elevator
 
-The server is a single container on a managed named volume, routed by
-space-elevator's Traefik at `https://elevator.albruiz.dev/app/omni-sync/`
-(path prefix stripped, so the app sees `/`).
+The server runs as a container on a managed named volume, routed by
+space-elevator's Traefik at:
 
-A compose stack is required, not a plain Dockerfile drop: archive/Dockerfile
-drops get a **synthetic** single-service compose with no volumes, and the
-server's whole job is holding state (SQLite + the chunk store). Shipping
-`compose.yml` makes the platform use **managed named volumes**
-(`se-vol-<app-id>-<hash>`), which survive redeploys.
+**https://elevator.albruiz.dev/app/omni-sync/** (path prefix stripped).
 
-## One-time: staging copy
+## Two things that matter
 
-`space-elevator` runs as the `services` user and must read the source. Build
-contexts are staged at `~/apps`, so an accessible copy is enough:
+1. **Ship a `compose.yml`, not a bare Dockerfile.** Archive/Dockerfile
+   drops get `SyntheticCompose()` — one service, **no volumes** — and the
+   server's whole job is holding state. A shipped compose file wins
+   (`deployer.resolveCompose` → `FindComposeFile`) and gets platform
+   managed named volumes, so the SQLite state and chunk store survive
+   redeploys.
+
+2. **Listen on port 80, as root inside the container.** SE's rootful
+   Traefik reaches a host-published web app on the port its own nginx
+   drops use. A non-root user cannot bind `:80`, so the container runs as
+   root (SE drops the dangerous capabilities and sets
+   `no-new-privileges`). The first deploy used 8787 as a non-root user and
+   came up `502` through Traefik even though the container logged
+   `listening on 0.0.0.0:8787`; port 80 routes.
+
+## Driving space-elevator
+
+SE runs as the `services` user. Use the `se` wrapper
+(`/usr/local/bin/se`), which the `service-admin` group may run
+non-interactively:
 
 ```sh
-sudo su services
-space-elevator apps upload /tmp/omni-sync-se --kind custom --name omni-sync \
-  --secret OMNI_SYNC_PASSWORD='<choose-a-strong-password>'
+se apps list                       # read-only
+se apps logs omni-sync --tail 50
 ```
 
-Watch it:
+The group is applied at login. In a shell that predates being added to
+`service-admin`, refresh it per command:
 
 ```sh
-space-elevator apps list            # until omni-sync shows running
-space-elevator apps logs omni-sync --tail 50
+sg service-admin -c 'se apps list'
 ```
+
+## Deploy / update
+
+The source is staged to a path `services` can read:
+
+```sh
+tar --exclude=./target --exclude=./.git -cf - . | (cd /tmp/omni-sync-se && tar xf -)
+chmod -R a+rX /tmp/omni-sync-se
+```
+
+First deploy:
+
+```sh
+sg service-admin -c "se apps upload /tmp/omni-sync-se --kind custom --name omni-sync \
+  --secret OMNI_SYNC_PASSWORD='<password>'"
+```
+
+Update an existing app (rebuilds, preserves volumes):
+
+```sh
+sg service-admin -c 'se apps update omni-sync --archive /tmp/omni-sync-se --yes'
+```
+
+`--kind custom` requires a Dockerfile; with `compose.yml` present the
+platform uses the compose stack.
 
 ## Verify from the outside
 
-Do not trust "running". Hit it through Traefik:
-
 ```sh
-curl -sS https://elevator.albruiz.dev/app/omni-sync/healthz
-# {"ok":true,"version":"0.1.0"}
-
-curl -sS -o /dev/null -w '%{http_code}\n' https://elevator.albruiz.dev/app/omni-sync/
-# 303 (redirect to the login page)
+curl -sS https://elevator.albruiz.dev/app/omni-sync/healthz          # {"ok":true,...}
+curl -sS -o /dev/null -w '%{http_code}\n' https://elevator.albruiz.dev/app/omni-sync/   # 303
 ```
 
-Then log in at that URL with `OMNI_SYNC_PASSWORD` and confirm the overview
-renders. If the app is `502`/`503`, the container is up but the route or the
-port is wrong — check `apps logs`.
-
-If the secret was not injected as an environment variable, the login page will
-say "no dashboard password is set". Set it explicitly instead:
-
-```sh
-space-elevator apps upload /tmp/omni-sync-se --kind custom --name omni-sync \
-  --env OMNI_SYNC_PASSWORD='<password>'
-```
+Log in with `OMNI_SYNC_PASSWORD` and confirm the overview renders.
 
 ## Enroll clients
 
 ```sh
-# dashboard → Devices → Add a device → copy the code
+# dashboard → devices → Add a device → copy the code
 omni-sync enroll --server https://elevator.albruiz.dev/app/omni-sync --code ABCD-EFGHJ
 omni-sync folders
 omni-sync add <folder-id> ~/Documents/Shared
 omni-sync daemon
 ```
 
-The client appends API paths *under* the base URL, so the `/app/omni-sync`
-prefix works without any special configuration.
-
-## Optional: a dedicated domain
-
-The plan's target is `sync.albruiz.dev` at the root of its own host. Attach it
-in the dashboard (or `POST /api/v1/apps/omni-sync/domains`), add the DNS record,
-and enroll with `--server https://sync.albruiz.dev`. No app change is needed.
+The client appends API paths *under* its base URL, so the `/app/omni-sync`
+prefix needs no special configuration.
 
 ## Persistence
 
 - `omnidata` → `/data` (content-addressed chunk store)
 - `omnistate` → `/state` (SQLite: devices, folders, ops, versions, overwrites)
 
-Both are platform-managed volumes, backed up before an update and restored if
-the new release fails to start. A redeploy keeps them as long as the logical
-volume names (`omnidata`, `omnistate`) do not change.
-
-## Updating
-
-```sh
-# replace the staged copy, then:
-space-elevator apps update omni-sync /tmp/omni-sync-se
-# or from an archive:
-space-elevator apps update omni-sync /tmp/omni-sync-se.tar.gz
-```
+Platform-managed volumes, backed up before an update and restored if the
+new release fails to start. Keep the logical volume names unchanged.
 
 ## Status
 
-Container build and runtime were verified **locally** (Podman on this host):
-image builds, `/healthz` answers, the dashboard login works, the `pair`
-subcommand runs in-container, and `/state` persists as uid `omni`. The
-space-elevator deploy itself is **unverified** here — this shell cannot reach
-the `services` user (`sudo`/`su` require a password that is not available
-non-interactively), so the `apps upload` step must be run by an operator.
+**Verified from the outside.**
+
+- `GET /healthz` → `{"ok":true,"version":"0.1.0"}`
+- `GET /` → `303` to login; login renders the dashboard; `/devices` mints
+  a pairing code; `/static/app.css` → `200`.
+- A real client enrolled against the public URL, joined a folder, and
+  pushed a file; `GET /api/v1/folders/{id}/manifest` over the public URL
+  showed it with the expected size and content hash.
+
+The port-80/root detail above was found the hard way: the 8787 non-root
+build reported `running` yet returned `502`, which is exactly the failure
+mode space-elevator's own AGENTS.md warns about.

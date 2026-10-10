@@ -181,16 +181,26 @@ compose file is what makes the platform use managed named volumes
 gets a synthetic compose with no persistence, which would lose the SQLite
 state and the chunk store on every redeploy.
 
+**Deployed and verified from the outside** at
+`https://elevator.albruiz.dev/app/omni-sync/` — health, login, pairing,
+static assets, and a real client enrolling and syncing a file over the
+public URL.
+
+Two non-obvious constraints that cost time, both in the deploy README:
+
+- **The container listens on :80 and runs as root inside the container.**
+  SE's rootful Traefik reaches a host-published web app on that port; a
+  non-root user cannot bind it. A non-root build on port 8787 came up
+  `502` through Traefik while the container logged `listening`.
+- **Drive SE through the `se` wrapper**, which needs the `service-admin`
+  group. The group is applied at login; `sg service-admin -c 'se ...'`
+  refreshes it in a shell that predates the group.
+
 Env the container understands: `OMNI_SYNC_ADDR`,
 `OMNI_SYNC_DATA_DIR`, `OMNI_SYNC_STATE_DIR`, and `OMNI_SYNC_PASSWORD`
 (hashed in memory when no stored hash exists, so no config file is baked).
 The client appends API paths *under* its base URL, so a sub-path
-deployment (`https://host/app/omni-sync/`) works unchanged.
-
-Container build and runtime are verified locally (Podman). The
-space-elevator deploy itself is **unverified** — the agent shell cannot
-reach the `services` user, so `apps upload` is an operator step. See the
-deploy README for the exact commands.
+deployment works unchanged.
 
 ## Known gaps (not bugs)
 

@@ -8,14 +8,15 @@ services:
   web:
     build: .
     # Bare port spec: the platform publishes it and Traefik discovers the
-    # container port. Do not hard-code a host port here.
+    # container port. Port 80 is the one space-elevator's rootful Traefik
+    # reaches for a host-published web app; do not hard-code a host port.
     ports:
-      - "8787"
+      - "80"
     volumes:
       - omnidata:/data
       - omnistate:/state
     environment:
-      OMNI_SYNC_ADDR: "0.0.0.0:8787"
+      OMNI_SYNC_ADDR: "0.0.0.0:80"
       OMNI_SYNC_DATA_DIR: "/data"
       OMNI_SYNC_STATE_DIR: "/state"
 
