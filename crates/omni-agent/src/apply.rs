@@ -3,10 +3,25 @@
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::UNIX_EPOCH;
 
 use omni_core::FileMeta;
 
 use crate::scan::path_from_bytes;
+
+/// The current on-disk mtime of a file, in nanoseconds.
+///
+/// The engine records this after applying a pull, so the *next* scan's metadata
+/// fast path matches and does not re-read the file it just wrote.
+pub fn local_mtime_ns(root: &Path, rel: &[u8]) -> io::Result<i64> {
+    let meta = fs::metadata(root.join(path_from_bytes(rel)))?;
+    Ok(meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0))
+}
 
 /// Write `bytes` at `rel` under `root`, via a temp file and a rename.
 ///

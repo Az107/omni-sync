@@ -35,9 +35,15 @@ overwrites + resolve), and the client engine (`omni-agent::Engine`) that
 scans, pushes ops+chunks and applies the pulled log.
 
 **M5 (hardening) is not built.** `history`, `resolve` and `flush` client
-subcommands still print their milestone; there is no chunk GC, no
-per-folder membership enforcement and no `notify`-driven wakeup (the
-engine polls every second, which is enough for now). See "Known gaps".
+subcommands still print their milestone; there is no chunk GC and no
+per-folder membership enforcement. See "Known gaps".
+
+**Change detection is watcher-driven.** Push runs on `notify` events
+(inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan; pull
+runs on a 2 s timer because remote changes are not filesystem events.
+Scanning reuses the last-synced chunk list for any file whose
+size/mtime/mode are unchanged, so an idle folder does no disk reads.
+Measured: ~1.6 s end-to-end propagation, ~5% of one core when idle.
 
 ## Commands
 
@@ -110,6 +116,14 @@ twice returns `400 invalid, expired or already-used pairing code`.
   re-applies what this device just sent. `base_version_id` comes from the
   per-path version map, and is sent as `None` (not `0`) for a path that
   has never synced.
+- **Push and pull run on separate cadences, on purpose.** Push is
+  `notify`-driven (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s
+  safety scan, because it must walk and hash the tree. Pull is a 2 s timer
+  of the op log, because a remote change is not a local filesystem event;
+  SSE/WebSocket push is the eventual replacement. Scanning reuses the
+  last-synced chunk list for files whose size/mtime/mode are unchanged, so
+  an idle folder does no disk reads. Inotify can drop events (queue
+  overflow, new directories, NFS), which is what the safety scan is for.
 - **Apply does not restore mtime.** Content (the chunk list) and mode are
   what matter; restoring mtime needs `utimensat`/libc and is deferred. A
   `FileMeta` equality therefore includes mtime, but sync decisions use
@@ -170,10 +184,12 @@ twice returns `400 invalid, expired or already-used pairing code`.
 - The dashboard covers overview, devices (with pairing codes), folders
   and overwrites (with *restore older*). It is plain form posts, no HTMX
   yet, and there is no per-file history view.
+- **The metadata fast path trusts mtime.** A file edited in place with
+  its timestamp preserved is not detected until its metadata changes.
+  That is the deliberate triage rule; a full-content `omni verify` is the
+  escape hatch and is not built yet.
 - **No chunk refcount GC.** `chunks.refs` is maintained on write; nothing
   reclaims unreferenced chunks yet.
-- **`notify` is not wired into the engine.** The watcher exists
-  (`omni_agent::watch`); the loop polls every second instead.
 - **`omni_agent::held()` always returns `None`.** On-close/live modes are
   modelled (`SyncMode`, `HoldRule`) but holder detection is not built.
 - The dashboard is plain form posts (no HTMX yet): overview, devices

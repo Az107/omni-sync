@@ -1,13 +1,16 @@
-//! The sync engine: push local changes, then pull remote ones.
+//! The sync engine.
 //!
-//! One cycle is deliberately simple:
-//! 1. scan the root into a manifest;
-//! 2. diff it against the last-synced state → ops to **push** (upload chunks,
-//!    submit ops, record the new version ids);
-//! 3. pull the op log since our watermark and **apply** each entry.
+//! Push and pull run on **separate cadences**, because they cost wildly
+//! different amounts:
 //!
-//! Running it on a short interval *is* the watcher for now; the `notify` handle
-//! in [`crate::watcher`] can shorten the interval later without touching this.
+//! - **push** needs to walk and hash the tree, so it is *event-driven* — the
+//!   `notify` watcher fires it on a change, with a slow safety scan (30 s) to
+//!   catch anything the watcher missed (edits while the daemon was down).
+//! - **pull** is a single HTTP GET of the op log, so it runs on a short timer
+//!   (2 s) to keep remote-change latency low.
+//!
+//! The scan itself only reads files whose size/mtime/mode changed since the
+//! last sync; unchanged files reuse their known chunk list without a read.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -21,12 +24,18 @@ use omni_transfer::Client;
 
 use crate::{apply, scan};
 
+/// How often the cheap op-log pull runs.
+const PULL_INTERVAL: Duration = Duration::from_secs(2);
+/// The slow full-tree safety scan, for changes the watcher did not see.
+const SAFETY_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+/// Quiet period after a filesystem event before scanning (coalesces save bursts).
+const DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// One folder to keep in sync.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     pub folder_id: String,
     pub root: PathBuf,
-    pub interval: Duration,
 }
 
 /// Drives one folder against one server.
@@ -54,17 +63,46 @@ impl Engine {
         }
     }
 
-    /// Run forever, logging and surviving cycle failures.
+    /// Run until the watcher's channel closes, logging and surviving cycle
+    /// failures. Push is watcher-driven; pull is on a short timer.
     pub async fn run(&self) -> Result<()> {
+        let (_handle, mut events) = crate::watcher::watch(&self.config.root)
+            .with_context(|| format!("watching {}", self.config.root.display()))?;
+
+        let mut pull = tokio::time::interval(PULL_INTERVAL);
+        let mut safety = tokio::time::interval(SAFETY_SCAN_INTERVAL);
+        pull.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
-            if let Err(error) = self.sync_once().await {
-                tracing::warn!(folder = %self.config.folder_id, %error, "sync cycle failed");
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    if event.is_none() {
+                        return Ok(());
+                    }
+                    // Let a burst of writes settle, then drain the rest.
+                    tokio::time::sleep(DEBOUNCE).await;
+                    while events.try_recv().is_ok() {}
+                    self.logged("push", self.push()).await;
+                }
+                _ = safety.tick() => {
+                    self.logged("safety scan", self.push()).await;
+                }
+                _ = pull.tick() => {
+                    self.logged("pull", self.pull()).await;
+                }
             }
-            tokio::time::sleep(self.config.interval).await;
         }
     }
 
-    /// One push+pull cycle.
+    async fn logged(&self, what: &str, work: impl std::future::Future<Output = Result<()>>) {
+        if let Err(error) = work.await {
+            tracing::warn!(folder = %self.config.folder_id, %error, "{} failed", what);
+        }
+    }
+
+    /// One push+pull cycle, for tests and manual runs.
     pub async fn sync_once(&self) -> Result<()> {
         self.push().await?;
         self.pull().await?;
@@ -72,15 +110,10 @@ impl Engine {
     }
 
     async fn push(&self) -> Result<()> {
-        // 1. Scan the root.
-        let (root, chunker) = (self.config.root.clone(), self.chunker);
-        let current = tokio::task::spawn_blocking(move || scan::scan(&root, &chunker))
-            .await
-            .context("scan task panicked")??;
-
-        // 2. What we last synced, and each path's version.
         let folder = self.config.folder_id.clone();
         let store = self.store.clone();
+
+        // What we last synced, each path's version, and our watermark.
         let (last, versions, applied_seq) = {
             let (f1, f2, f3) = (folder.clone(), folder.clone(), folder.clone());
             let last = store
@@ -95,12 +128,18 @@ impl Engine {
             (last, versions, seq)
         };
 
+        // Scan, reusing the last-synced chunks for files whose metadata is
+        // unchanged (so an idle folder does no disk reads at all).
+        let (root, chunker, previous) = (self.config.root.clone(), self.chunker, last.clone());
+        let current = tokio::task::spawn_blocking(move || scan::scan(&root, &chunker, &previous))
+            .await
+            .context("scan task panicked")??;
+
         let local = changes(&last, &current);
         if local.is_empty() {
             return Ok(());
         }
 
-        // 3. Turn each change into an op, uploading chunks for puts.
         let mut pending = Vec::new();
         for change in &local {
             match change {
@@ -142,15 +181,14 @@ impl Engine {
             }
         }
 
-        let dtos = pending.iter().map(|p| p.dto.clone()).collect();
+        let pushed = pending.len();
+        let dtos = pending.iter().map(|item| item.dto.clone()).collect();
         let response = self
             .client
             .submit_ops(&self.config.folder_id, dtos)
             .await
             .context("submitting ops")?;
 
-        // 4. Record success: the new version ids and the advanced watermark.
-        let pushed = pending.len();
         let store = self.store.clone();
         let folder = self.config.folder_id.clone();
         store
@@ -170,11 +208,7 @@ impl Engine {
             })
             .await?;
 
-        tracing::info!(
-            folder = %self.config.folder_id,
-            pushed,
-            "pushed changes"
-        );
+        tracing::info!(folder = %self.config.folder_id, pushed, "pushed changes");
         Ok(())
     }
 
@@ -226,19 +260,34 @@ impl Engine {
                 }
                 OpKindDto::Put | OpKindDto::Resolve | OpKindDto::Move => {
                     let bytes = self.fetch_chunks(&entry.chunks).await?;
+                    apply::write_file(
+                        &self.config.root,
+                        &path,
+                        &bytes,
+                        &FileMeta {
+                            size: entry.size,
+                            mtime_ns: entry.mtime_ns,
+                            mode: entry.mode,
+                            chunks: decode_chunks(&entry.chunks),
+                        },
+                    )
+                    .with_context(|| format!("writing {}", String::from_utf8_lossy(&path)))?;
+
+                    // Record the *local* mtime, so the next scan's metadata fast
+                    // path matches and does not re-read the file we just wrote.
+                    let mtime_ns =
+                        apply::local_mtime_ns(&self.config.root, &path).unwrap_or(entry.mtime_ns);
                     let meta = FileMeta {
                         size: entry.size,
-                        mtime_ns: entry.mtime_ns,
+                        mtime_ns,
                         mode: entry.mode,
                         chunks: decode_chunks(&entry.chunks),
                     };
-                    apply::write_file(&self.config.root, &path, &bytes, &meta)
-                        .with_context(|| format!("writing {}", String::from_utf8_lossy(&path)))?;
                     let folder = folder.clone();
-                    let stored = meta.clone();
+                    let version_id = entry.version_id;
                     self.store
                         .blocking(move |conn| {
-                            agent::set_file(conn, &folder, &path, &stored, entry.version_id)
+                            agent::set_file(conn, &folder, &path, &meta, version_id)
                         })
                         .await?;
                 }

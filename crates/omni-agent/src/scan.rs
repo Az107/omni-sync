@@ -13,9 +13,19 @@ use omni_chunk::{Chunker, HashedChunk};
 use omni_core::{ChunkRef, FileMeta, Manifest, PathBytes};
 
 /// Scan `root` recursively into a manifest.
-pub fn scan(root: &Path, chunker: &Chunker) -> io::Result<Manifest> {
+///
+/// `previous` is the last-synced manifest. A file whose size, mtime and mode
+/// match an entry there is **not read**: its chunk list is reused. That is the
+/// "metadata is triage" rule — we hash only what looks changed.
+///
+/// The cost of the shortcut is that a file edited in place with its timestamp
+/// preserved will be missed until its metadata changes. A periodic full-content
+/// re-verify would close that hole at the price of reading the whole tree; it is
+/// deliberately not wired into the steady-state loop, and belongs in an
+/// explicit `omni verify` command instead.
+pub fn scan(root: &Path, chunker: &Chunker, previous: &Manifest) -> io::Result<Manifest> {
     let mut manifest = Manifest::new();
-    walk(root, root, chunker, &mut manifest)?;
+    walk(root, root, chunker, previous, &mut manifest)?;
     Ok(manifest)
 }
 
@@ -45,7 +55,13 @@ pub fn chunk_file(
     Ok((file_meta, hashed))
 }
 
-fn walk(root: &Path, dir: &Path, chunker: &Chunker, manifest: &mut Manifest) -> io::Result<()> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    chunker: &Chunker,
+    previous: &Manifest,
+    manifest: &mut Manifest,
+) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -56,11 +72,25 @@ fn walk(root: &Path, dir: &Path, chunker: &Chunker, manifest: &mut Manifest) -> 
         let file_type = entry.file_type()?;
 
         if file_type.is_dir() {
-            walk(root, &path, chunker, manifest)?;
+            walk(root, &path, chunker, previous, manifest)?;
         } else if file_type.is_file() {
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            let bytes = fs::read(&path)?;
             let meta = fs::metadata(&path)?;
+            let mtime = mtime_ns(&meta);
+            let mode = mode(&meta);
+
+            // Fast path: identical metadata to last sync → reuse the known
+            // chunks without reading a byte.
+            if let Some(known) = previous.get(&path_bytes(rel))
+                && known.size == meta.len()
+                && known.mtime_ns == mtime
+                && known.mode == mode
+            {
+                manifest.insert(path_bytes(rel), known.clone());
+                continue;
+            }
+
+            let bytes = fs::read(&path)?;
             let chunks: Vec<ChunkRef> = chunker
                 .chunk_and_hash(&bytes)
                 .into_iter()
@@ -70,8 +100,8 @@ fn walk(root: &Path, dir: &Path, chunker: &Chunker, manifest: &mut Manifest) -> 
                 path_bytes(rel),
                 FileMeta {
                     size: bytes.len() as u64,
-                    mtime_ns: mtime_ns(&meta),
-                    mode: mode(&meta),
+                    mtime_ns: mtime,
+                    mode,
                     chunks,
                 },
             );
@@ -161,7 +191,7 @@ mod tests {
         std::fs::write(source.path().join(".DS_Store"), b"junk").unwrap();
         std::fs::write(source.path().join("wip.part"), b"partial").unwrap();
 
-        let manifest = scan(source.path(), &chunker).unwrap();
+        let manifest = scan(source.path(), &chunker, &Manifest::new()).unwrap();
         assert_eq!(manifest.len(), 2, "ignored files must be skipped");
 
         // Write each file into the target using the pulled bytes.
@@ -174,7 +204,7 @@ mod tests {
             apply::write_file(target.path(), rel, &bytes, meta).unwrap();
         }
 
-        let reapplied = scan(target.path(), &chunker).unwrap();
+        let reapplied = scan(target.path(), &chunker, &Manifest::new()).unwrap();
         assert_eq!(
             reapplied.keys().collect::<Vec<_>>(),
             manifest.keys().collect::<Vec<_>>(),
@@ -194,5 +224,39 @@ mod tests {
     fn removing_a_missing_file_is_not_an_error() {
         let root = tempfile::tempdir().unwrap();
         apply::remove_file(root.path(), b"never-existed").unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_read_again() {
+        use omni_chunk::hash_hex;
+
+        let chunker = Chunker::new(Config::small());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"hello world").unwrap();
+
+        // A "previous" manifest with correct metadata but deliberately wrong
+        // chunks. If the fast path works, the scan reuses those chunks without
+        // reading the file — proving it did not hash it.
+        let real = scan(root.path(), &chunker, &Manifest::new()).unwrap();
+        let mut poisoned = real.clone();
+        poisoned.insert(
+            b"a.txt".to_vec(),
+            FileMeta {
+                size: 11,
+                mtime_ns: real.get(b"a.txt".as_slice()).unwrap().mtime_ns,
+                mode: real.get(b"a.txt".as_slice()).unwrap().mode,
+                chunks: vec![ChunkRef::new("poisoned", 11)],
+            },
+        );
+
+        let rescanned = scan(root.path(), &chunker, &poisoned).unwrap();
+        assert_eq!(
+            rescanned.get(b"a.txt".as_slice()).unwrap().chunks,
+            vec![ChunkRef::new("poisoned", 11)],
+            "unchanged metadata must short-circuit the read"
+        );
+
+        // Sanity: a real read would have produced the true hash.
+        assert_ne!(hash_hex(b"hello world"), "poisoned");
     }
 }

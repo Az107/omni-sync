@@ -4,16 +4,12 @@
 //! runs the watcher/sync loop for every recorded folder.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use omni_agent::{Engine, EngineConfig};
 use omni_store::Store;
-
-/// How often a folder is rescanned and the op log polled.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Parser)]
 #[command(
@@ -173,7 +169,6 @@ async fn daemon(config_path: &Path) -> anyhow::Result<()> {
             EngineConfig {
                 folder_id: entry.folder_id.clone(),
                 root: entry.path.clone(),
-                interval: POLL_INTERVAL,
             },
         );
         tracing::info!(folder = %entry.folder_id, path = %entry.path.display(), "syncing");
@@ -185,9 +180,8 @@ async fn daemon(config_path: &Path) -> anyhow::Result<()> {
     }
 
     println!(
-        "omni-sync daemon: {} folder(s), polling every {}s",
-        config.folders.len(),
-        POLL_INTERVAL.as_secs()
+        "omni-sync daemon: {} folder(s); watching for changes, polling the log every 2s",
+        config.folders.len()
     );
     tokio::signal::ctrl_c().await?;
     Ok(())
