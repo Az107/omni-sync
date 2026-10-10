@@ -4,10 +4,14 @@
 //! real filesystem watcher — but not the sync loop itself. Watching, chunking,
 //! uploading and applying land in M3, on top of these modules.
 
+mod apply;
+mod engine;
 mod hold;
 mod policy;
+mod scan;
 mod watcher;
 
+pub use engine::{Engine, EngineConfig};
 pub use hold::{HeldReason, held};
 pub use policy::{HoldRule, SyncMode};
 pub use watcher::{WatchHandle, watch};

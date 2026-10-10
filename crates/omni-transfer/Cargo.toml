@@ -10,4 +10,5 @@ description = "HTTP client for the omni-sync server API"
 [dependencies]
 omni-netproto.workspace = true
 reqwest.workspace = true
+serde.workspace = true
 thiserror.workspace = true

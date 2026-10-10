@@ -1182,9 +1182,16 @@ dependencies = [
 name = "omni-agent"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "notify",
  "omni-chunk",
+ "omni-core",
+ "omni-netproto",
+ "omni-store",
+ "omni-transfer",
+ "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1202,11 +1209,15 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "omni-agent",
  "omni-netproto",
+ "omni-store",
  "omni-transfer",
  "serde",
  "tokio",
  "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1274,6 +1285,7 @@ version = "0.1.0"
 dependencies = [
  "omni-netproto",
  "reqwest",
+ "serde",
  "thiserror",
 ]
 

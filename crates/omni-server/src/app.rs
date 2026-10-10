@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use omni_core::{Op, OpKind};
 use omni_netproto::{
-    ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
+    AppliedOpDto, ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
     FoldersResponse, HealthResponse, LogEntryDto, ManifestEntryDto, ManifestResponse, OpKindDto,
     OpsResponse, OverwriteDto, PROTOCOL_VERSION, ResolveRequest, SubmitOpsRequest,
     SubmitOpsResponse,
@@ -361,15 +361,18 @@ async fn submit_ops(
 ) -> Result<Json<SubmitOpsResponse>, AppError> {
     let device = authenticate(&state, &headers).await?;
 
-    let mut last_seq = 0;
+    let mut applied = Vec::new();
     let mut overwrites = Vec::new();
     for dto in &request.ops {
         let op = dto
             .to_core()
             .map_err(|_| AppError::BadRequest("a path is not valid base64".into()))?;
-        let applied = state.apply(&folder_id, &device.id, op).await?;
-        last_seq = applied.seq;
-        if let Some(overwrite) = applied.overwrite {
+        let result = state.apply(&folder_id, &device.id, op).await?;
+        applied.push(AppliedOpDto {
+            seq: result.seq,
+            version_id: result.version_id,
+        });
+        if let Some(overwrite) = result.overwrite {
             overwrites.push(OverwriteDto {
                 path: dto.path.clone(),
                 losing_version_id: overwrite.losing_version_id,
@@ -379,7 +382,7 @@ async fn submit_ops(
     }
 
     Ok(Json(SubmitOpsResponse {
-        seq: last_seq,
+        applied,
         overwrites,
     }))
 }
@@ -458,7 +461,10 @@ async fn resolve(
     };
     let applied = state.apply(&folder_id, &device.id, op).await?;
     Ok(Json(SubmitOpsResponse {
-        seq: applied.seq,
+        applied: vec![AppliedOpDto {
+            seq: applied.seq,
+            version_id: applied.version_id,
+        }],
         overwrites: Vec::new(),
     }))
 }

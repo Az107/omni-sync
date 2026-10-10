@@ -89,11 +89,17 @@ pub struct SubmitOpsRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubmitOpsResponse {
-    /// The op id the server assigned to the last op in the batch.
-    pub seq: i64,
+    /// One entry per submitted op, in request order.
+    pub applied: Vec<AppliedOpDto>,
     /// Overwrite review entries raised by this batch, if any.
     #[serde(default)]
     pub overwrites: Vec<OverwriteDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppliedOpDto {
+    pub seq: i64,
+    pub version_id: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

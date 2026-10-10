@@ -18,19 +18,23 @@ One Rust workspace, several crates, two binaries.
 
 ## Status
 
-**M0 is done and verified end to end.** Workspace, config layering,
-SQLite schemas for both sides, `init`/`serve`/`pair`/`doctor`,
-pairing-code enrollment, and an Argon2-gated dashboard. The smoke path
-was run for real: `init` → `serve` → `pair` → client `enroll` → device
-in `doctor` → dashboard login → a reused code is refused.
+**M0–M3 are done; the MVP syncs.** A server and two client daemons were
+run against each other and the following held: a create (including a
+binary file, byte-identical on both sides), an edit propagating both
+ways within ~2 s, a delete propagating, and an offline edit on both
+devices producing exactly one overwrite row with last-write-wins
+converging both devices on the same content. 46 tests, clippy clean.
 
-**M1 is partly done.** The content-defined chunker (`omni-chunk`) and the
-last-write-wins sequencer (`omni-core`) exist with tests. Still to do for
-M1: file hashing, the scan/diff/apply path.
+What exists: the whole pure core (`omni-core`, `omni-chunk`), the wire
+contract, both SQLite schemas, the server with its `/api/v1` surface and
+chunk store, and the client engine (`omni-agent::Engine`) that scans,
+pushes ops+chunks and applies the pulled log.
 
-Folders, the op/chunk endpoints, the watcher loop and the dashboard
-pages are M2–M4 and are **not built yet** — the client subcommands print
-the milestone they land in.
+**M4 (dashboard pages) and M5 (hardening) are not built.** The dashboard
+is one overview page; `history`, `resolve` and `flush` still print their
+milestone; there is no chunk GC, no per-folder membership enforcement and
+no `notify`-driven wakeup (the engine polls every second, which is enough
+for now). See "Known gaps".
 
 ## Commands
 
@@ -80,9 +84,10 @@ twice returns `400 invalid, expired or already-used pairing code`.
 - **Binary names come from explicit `[[bin]]`.** `omni-cli` produces
   `omni-sync`; `omni-server` produces `omni-sync-server`. Relying on the
   package name will surprise you.
-- **`omni-core` and `omni-chunk` have no dependencies at all.** That is
-  the point: the rules and the chunker are tested without a runtime, a
-  database or a socket. Keep I/O out of them.
+- **`omni-core` and `omni-chunk` carry no I/O.** `omni-core` depends on
+  serde (its value types derive it) and `omni-chunk` on `sha2`/`hex`;
+  neither touches a file, a socket or a database. That is what keeps the
+  rules and the chunker testable in isolation.
 - **Paths are bytes.** `omni_core::PathBytes` is `Vec<u8>`. The wire
   base64-encodes them (`omni-netproto`), SQLite stores them as `BLOB`.
   Never round-trip a path through `String`/`to_string_lossy`.
@@ -92,6 +97,20 @@ twice returns `400 invalid, expired or already-used pairing code`.
   consumption.
 - **The server binds loopback.** TLS and the public hostname are
   Traefik's job; do not add a TLS listener here.
+- **The client DB is keyed by the config file's name** (`a.toml` →
+  `a.agent.db`), not just its directory. Two clients sharing one DB was a
+  real bug: they clobbered each other's `file_state` and every file
+  became a delete/overwrite storm.
+- **`omni-agent::Engine` pushes before it pulls, and records its own
+  result.** A push sets `file_state` (with the returned `version_id`) and
+  advances `applied_seq` past its own ops, so the following pull never
+  re-applies what this device just sent. `base_version_id` comes from the
+  per-path version map, and is sent as `None` (not `0`) for a path that
+  has never synced.
+- **Apply does not restore mtime.** Content (the chunk list) and mode are
+  what matter; restoring mtime needs `utimensat`/libc and is deferred. A
+  `FileMeta` equality therefore includes mtime, but sync decisions use
+  `FileMeta::equivalent` (chunks + mode).
 - **askama's `render()` is a trait method.** `use askama::Template as _;`
   must be in scope where you call it, not only where the struct is
   defined.
@@ -138,12 +157,36 @@ twice returns `400 invalid, expired or already-used pairing code`.
 
 ## Known gaps (not bugs)
 
-- The client daemon is a stub: `add`, `daemon`, `status`, `folders`,
-  `doctor` print the milestone they land in. Only `enroll` is wired.
-- `omni_agent::held()` always returns `None`. The `/proc` holder
-  detection (live vs on-close) is M3.
-- No ops or chunk endpoints yet; the dashboard has one page (overview)
-  and no HTMX interactions.
-- `omni-core`'s `Op`/`Version` and `omni-netproto`'s DTOs are
-  deliberately separate types; the conversions between them land with
-  the endpoints in M2.
+- `history`, `resolve` and `flush` still print "not implemented yet". The
+  server-side `resolve` endpoint exists; only the client subcommands are
+  stubs.
+- **Move ops are refused** (`StoreError::Unsupported`); a rename is a
+  delete + put at the client. The op kind exists in the schema.
+- **Per-folder membership is not enforced.** Any enrolled device may read
+  or write any folder. `members` exists but is unused.
+- **No chunk refcount GC.** `chunks.refs` is maintained on write; nothing
+  reclaims unreferenced chunks yet.
+- **`notify` is not wired into the engine.** The watcher exists
+  (`omni_agent::watch`); the loop polls every second instead.
+- **`omni_agent::held()` always returns `None`.** On-close/live modes are
+  modelled (`SyncMode`, `HoldRule`) but holder detection is not built.
+- The dashboard is one overview page. No devices/folders/overwrites
+  pages, no HTMX interactions.
+- `omni-core`'s `Op`/`Version` and `omni-netproto`'s DTOs are deliberately
+  separate types, bridged by `omni-netproto::convert`.
+
+### Verification recipe (two clients)
+
+```sh
+# server + a folder + two enrollments, then two daemons on two dirs
+FOLDER=$(./target/debug/omni-sync-server --config $R/server.toml folder create Docs)
+# ... enroll a.toml and b.toml, `add $FOLDER` each dir ...
+./target/debug/omni-sync --config $R/a.toml daemon &
+./target/debug/omni-sync --config $R/b.toml daemon &
+```
+
+What to check: a file written in one dir appears byte-identical in the
+other within ~2 s; an edit propagates both ways; a delete propagates; and
+an offline edit on both sides leaves exactly one entry in
+`GET /api/v1/overwrites` with both devices converged on the same content.
+`RUST_LOG=info` makes the daemon print `pushed changes` per cycle.

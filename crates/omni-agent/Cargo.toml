@@ -8,6 +8,15 @@ repository.workspace = true
 description = "The omni-sync client daemon: watcher, holds and apply"
 
 [dependencies]
+anyhow.workspace = true
 notify.workspace = true
 omni-chunk.workspace = true
+omni-core.workspace = true
+omni-netproto.workspace = true
+omni-store.workspace = true
+omni-transfer.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
