@@ -33,7 +33,14 @@ pub struct Client {
 
 impl Client {
     pub fn new(base_url: &str) -> Result<Self, TransferError> {
-        let base = Url::parse(base_url).map_err(|e| TransferError::Url(e.to_string()))?;
+        let mut base = Url::parse(base_url).map_err(|e| TransferError::Url(e.to_string()))?;
+        // Normalise to a trailing slash so relative endpoints append *under* the
+        // base path. That is what makes a sub-path deployment work, e.g. behind
+        // space-elevator at https://host/app/omni-sync/.
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
         Ok(Self {
             http: reqwest::Client::new(),
             base,
@@ -48,8 +55,10 @@ impl Client {
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, TransferError> {
+        // Relative join: a leading '/' would reset to the host root and drop a
+        // deployment's base path.
         self.base
-            .join(path)
+            .join(path.trim_start_matches('/'))
             .map_err(|e| TransferError::Url(e.to_string()))
     }
 
@@ -153,4 +162,34 @@ async fn json<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, Tra
         });
     }
     Ok(response.json::<T>().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn endpoints_resolve_under_a_subpath_base() {
+        // Behind space-elevator: https://host/app/omni-sync/
+        let client = Client::new("https://host/app/omni-sync").unwrap();
+        assert_eq!(
+            client.endpoint("/api/v1/devices/enroll").unwrap().as_str(),
+            "https://host/app/omni-sync/api/v1/devices/enroll"
+        );
+    }
+
+    #[test]
+    fn endpoints_resolve_at_a_root_domain() {
+        let client = Client::new("https://sync.example.com").unwrap();
+        assert_eq!(
+            client.endpoint("/api/v1/chunks/abc").unwrap().as_str(),
+            "https://sync.example.com/api/v1/chunks/abc"
+        );
+        // A trailing slash on the base is equivalent.
+        let client = Client::new("https://sync.example.com/").unwrap();
+        assert_eq!(
+            client.endpoint("/healthz").unwrap().as_str(),
+            "https://sync.example.com/healthz"
+        );
+    }
 }

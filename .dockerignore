@@ -1,0 +1,8 @@
+target
+.git
+.gitignore
+**/*.db
+**/*.db-wal
+**/*.db-shm
+client.toml
+server.toml

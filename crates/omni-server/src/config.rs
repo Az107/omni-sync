@@ -64,6 +64,11 @@ impl Config {
 
     /// Load the file at `explicit` (or the default path), then apply env
     /// overrides. A missing file is not an error: defaults are a valid server.
+    ///
+    /// Container-friendly env, all optional: `OMNI_SYNC_ADDR`,
+    /// `OMNI_SYNC_DATA_DIR`, `OMNI_SYNC_STATE_DIR`, and `OMNI_SYNC_PASSWORD`
+    /// (hashed in memory when no stored hash exists, so a container needs no
+    /// pre-baked config file).
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = explicit
             .map(Path::to_path_buf)
@@ -78,6 +83,25 @@ impl Config {
             && !addr.is_empty()
         {
             config.addr = addr;
+        }
+        if let Ok(dir) = std::env::var("OMNI_SYNC_DATA_DIR")
+            && !dir.is_empty()
+        {
+            config.data_dir = PathBuf::from(dir);
+        }
+        if let Ok(dir) = std::env::var("OMNI_SYNC_STATE_DIR")
+            && !dir.is_empty()
+        {
+            config.state_dir = PathBuf::from(dir);
+        }
+        // A container supplies the password via the environment; hash it here so
+        // it never needs to be written to a file.
+        if config.dashboard_password_hash.is_empty()
+            && let Ok(password) = std::env::var("OMNI_SYNC_PASSWORD")
+            && !password.is_empty()
+        {
+            config.dashboard_password_hash =
+                crate::auth::hash_password(&password).unwrap_or_default();
         }
         Ok(config)
     }

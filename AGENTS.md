@@ -172,6 +172,26 @@ twice returns `400 invalid, expired or already-used pairing code`.
   the code uses let-chains (`if let ... && let ...`) which require
   edition 2024.
 
+## Deploying
+
+The server ships as a container with a space-elevator compose stack:
+`Dockerfile`, `compose.yml`, and `deploy/space-elevator/README.md`. The
+compose file is what makes the platform use managed named volumes
+(`omnidata` → `/data`, `omnistate` → `/state`); a plain Dockerfile drop
+gets a synthetic compose with no persistence, which would lose the SQLite
+state and the chunk store on every redeploy.
+
+Env the container understands: `OMNI_SYNC_ADDR`,
+`OMNI_SYNC_DATA_DIR`, `OMNI_SYNC_STATE_DIR`, and `OMNI_SYNC_PASSWORD`
+(hashed in memory when no stored hash exists, so no config file is baked).
+The client appends API paths *under* its base URL, so a sub-path
+deployment (`https://host/app/omni-sync/`) works unchanged.
+
+Container build and runtime are verified locally (Podman). The
+space-elevator deploy itself is **unverified** — the agent shell cannot
+reach the `services` user, so `apps upload` is an operator step. See the
+deploy README for the exact commands.
+
 ## Known gaps (not bugs)
 
 - `history`, `resolve` and `flush` still print "not implemented yet". The

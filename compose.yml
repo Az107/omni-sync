@@ -1,0 +1,24 @@
+# space-elevator compose stack for the omni-sync server.
+#
+# A repo that ships its own compose file wins over synthesized builds, so this
+# is what `space-elevator apps upload <dir>` parses. Named volumes are managed
+# by the platform (`se-vol-<app-id>-<hash>`), so the SQLite state and the chunk
+# store survive redeploys.
+services:
+  web:
+    build: .
+    # Bare port spec: the platform publishes it and Traefik discovers the
+    # container port. Do not hard-code a host port here.
+    ports:
+      - "8787"
+    volumes:
+      - omnidata:/data
+      - omnistate:/state
+    environment:
+      OMNI_SYNC_ADDR: "0.0.0.0:8787"
+      OMNI_SYNC_DATA_DIR: "/data"
+      OMNI_SYNC_STATE_DIR: "/state"
+
+volumes:
+  omnidata:
+  omnistate:
