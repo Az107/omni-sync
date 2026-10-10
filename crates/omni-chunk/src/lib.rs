@@ -9,10 +9,12 @@
 //! Sizes default to the plan's values: 64 KiB min, 256 KiB average, 1 MiB max.
 
 mod gear;
+mod hash;
 
 use std::io::{self, Read};
 
 use gear::GEAR;
+pub use hash::{hash_bytes, hash_hex};
 
 /// Chunk size bounds. `avg` is rounded up to a power of two for the mask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +56,14 @@ pub struct Chunk {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnedChunk {
     pub offset: u64,
+    pub data: Vec<u8>,
+}
+
+/// A chunk with the address it will be stored under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HashedChunk {
+    pub hash: String,
+    pub len: u64,
     pub data: Vec<u8>,
 }
 
@@ -104,6 +114,23 @@ impl Chunker {
             });
         }
         chunks
+    }
+
+    /// Split in memory and hash each chunk, ready to upload. This is the shape
+    /// the client actually needs: a list of `(hash, bytes)` to store and
+    /// reference.
+    pub fn chunk_and_hash(&self, data: &[u8]) -> Vec<HashedChunk> {
+        self.split(data)
+            .into_iter()
+            .map(|chunk| {
+                let bytes = &data[chunk.offset..chunk.offset + chunk.len];
+                HashedChunk {
+                    hash: hash_hex(bytes),
+                    len: chunk.len as u64,
+                    data: bytes.to_vec(),
+                }
+            })
+            .collect()
     }
 
     /// Split a stream, holding at most about one max-sized chunk in memory.
@@ -266,5 +293,24 @@ mod tests {
                 &owned.data[..]
             );
         }
+    }
+
+    #[test]
+    fn chunk_and_hash_addresses_every_chunk_and_covers_the_file() {
+        let c = Chunker::new(Config::small());
+        let data = noisy(40_000, 6);
+        let hashed = c.chunk_and_hash(&data);
+
+        // Reassembly is lossless and in order.
+        let mut rebuilt = Vec::new();
+        for chunk in &hashed {
+            assert_eq!(chunk.hash, hash_hex(&chunk.data));
+            assert_eq!(chunk.len, chunk.data.len() as u64);
+            rebuilt.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(rebuilt, data);
+
+        // The same bytes chunk to the same addresses, twice.
+        assert_eq!(hashed, c.chunk_and_hash(&data));
     }
 }

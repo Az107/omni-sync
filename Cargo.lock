@@ -1190,6 +1190,10 @@ dependencies = [
 [[package]]
 name = "omni-chunk"
 version = "0.1.0"
+dependencies = [
+ "hex",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "omni-cli"
@@ -1214,6 +1218,7 @@ name = "omni-netproto"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "omni-core",
  "serde",
  "serde_json",
 ]

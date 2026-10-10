@@ -12,6 +12,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 
+mod convert;
+pub use convert::{decode_chunks, decode_file_meta, encode_chunks, entry_path};
+
 /// Bumped when the wire shape changes incompatibly. `Hello`/`enroll` carry it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -96,6 +99,45 @@ pub struct OverwriteDto {
     pub path: String,
     pub losing_version_id: i64,
     pub winning_version_id: i64,
+}
+
+/// One file's current state, as the server reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestEntryDto {
+    pub path: String,
+    pub version_id: i64,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub chunks: Vec<ChunkRefDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManifestResponse {
+    pub entries: Vec<ManifestEntryDto>,
+}
+
+/// One entry of the op log as a client pulls it: the op *and* the content it
+/// produced, so applying never needs a second lookup.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEntryDto {
+    pub seq: i64,
+    pub kind: OpKindDto,
+    pub path: String,
+    pub device_id: String,
+    #[serde(default)]
+    pub size: u64,
+    #[serde(default)]
+    pub mtime_ns: i64,
+    #[serde(default)]
+    pub mode: u32,
+    #[serde(default)]
+    pub chunks: Vec<ChunkRefDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpsResponse {
+    pub entries: Vec<LogEntryDto>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

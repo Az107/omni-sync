@@ -9,6 +9,7 @@ description = "The /api/v1 wire contract for omni-sync"
 
 [dependencies]
 base64.workspace = true
+omni-core.workspace = true
 serde.workspace = true
 
 [dev-dependencies]

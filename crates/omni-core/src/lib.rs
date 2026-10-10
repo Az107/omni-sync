@@ -11,10 +11,12 @@
 //! not guaranteed to be UTF-8, and a lossy round-trip is how one device's
 //! `résumé.pdf` becomes another device's differently-named file.
 
+mod manifest;
 mod op;
 mod sequencer;
 mod version;
 
+pub use manifest::{Change, FileMeta, Manifest, changes};
 pub use op::{ChunkRef, Op, OpKind};
 pub use sequencer::{Decision, Sequencer};
 pub use version::{PathBytes, Version};

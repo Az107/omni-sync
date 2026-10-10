@@ -8,5 +8,8 @@ repository.workspace = true
 description = "Content-defined chunking (gear-hash FastCDC) for omni-sync"
 
 [dependencies]
-# Intentionally empty: the chunker is pure and hashing lives at the call site
-# (omni-agent / omni-server), so this crate stays trivially testable.
+# The chunker is pure, but content hashing (sha256) belongs with it: a chunk
+# only means anything together with the hash it was addressed by. Still no I/O,
+# no runtime, no database.
+hex.workspace = true
+sha2.workspace = true
