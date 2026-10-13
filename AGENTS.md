@@ -63,6 +63,12 @@ cargo run -p omni-server -- doctor
 cargo run -p omni-cli -- enroll --server http://127.0.0.1:8787 --code ABCD-EFGHJ
 ```
 
+CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
+and release-builds both binaries on every push and PR; `release.yml`
+attaches `omni-sync` and `omni-sync-server` tarballs to a GitHub release
+when a `v*` tag is pushed. Both pin Rust 1.89.0 to match
+`rust-toolchain.toml`.
+
 ### M0 smoke test
 
 Self-contained; uses `/tmp` so it never touches real per-user dirs.

@@ -1,5 +1,7 @@
 # omni-sync
 
+[![CI](https://github.com/Az107/omni-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/Az107/omni-sync/actions/workflows/ci.yml)
+
 Automatic file sync between devices: an always-on **server** with a
 dashboard (devices, folders, version history, overwrites) and a watching
 **client** daemon per device.

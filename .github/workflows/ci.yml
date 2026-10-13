@@ -1,0 +1,96 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+# A new push to the same branch supersedes the run in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to match rust-toolchain.toml (edition 2024 needs >= 1.85, the
+      # manifest's floor is 1.89).
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      # Hermetic: no network, no sockets.
+      - run: cargo test --workspace --locked
+
+  build:
+    name: build ${{ matrix.bin }}
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: omni-cli
+            bin: omni-sync
+          - package: omni-server
+            bin: omni-sync-server
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+
+      # aws-lc-rs (reqwest's rustls backend) and rusqlite's bundled SQLite need
+      # cmake + a C compiler; the hosted runner already has both.
+      - run: cargo build --release --locked -p ${{ matrix.package }}
+
+      - name: Smoke test the binary
+        run: ./target/release/${{ matrix.bin }} --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin }}-linux-x86_64
+          path: target/release/${{ matrix.bin }}
+          if-no-files-found: error
+          retention-days: 14
+
+  # The server's deploy path is the container, so a broken Dockerfile should
+  # fail here rather than at `se apps update`.
+  docker:
+    name: docker build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
