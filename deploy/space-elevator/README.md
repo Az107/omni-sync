@@ -65,6 +65,31 @@ sg service-admin -c 'se apps update omni-sync --archive /tmp/omni-sync-se --yes'
 `--kind custom` requires a Dockerfile; with `compose.yml` present the
 platform uses the compose stack.
 
+## Updating the server binary from GitHub
+
+The container's `docker-entrypoint.sh` prefers a binary on the `/state`
+volume. To move to a published release without rebuilding the image:
+
+```sh
+sg service-admin -c 'se apps exec omni-sync -- /usr/local/bin/docker-entrypoint.sh --help'  # sanity
+# inside the container (or via `se apps exec`):
+omni-sync-server update --check
+omni-sync-server update --download-only /state/bin
+# restart so the entrypoint picks up the staged binary:
+sg service-admin -c 'se apps restart omni-sync'
+```
+
+`update` downloads the release asset for `x86_64-unknown-linux-gnu`,
+verifies it against the release's `SHA256SUMS`, and writes it to
+`/state/bin/omni-sync-server` (executable). The staged binary survives
+redeploys because `/state` is a managed volume; delete it to return to
+the image's binary after a `se apps update`.
+
+**While the GitHub repo is private**, the updater needs a token to read
+the release. Set `OMNI_SYNC_GITHUB_TOKEN` for the container (compose
+passes it through when the host environment has it). Once the repo is
+public, unset it.
+
 ## Verify from the outside
 
 ```sh

@@ -26,15 +26,34 @@
       <button type="submit">Create</button>
     </form>
 
-    <table>
-      <thead><tr><th>name</th><th>id</th></tr></thead>
-      <tbody>
-      {% for folder in folders %}
-        <tr><td>{{ folder.name }}</td><td class="mono">{{ folder.id }}</td></tr>
-      {% endfor %}
-      </tbody>
-    </table>
-    <p class="muted">Clients join with <code>omni-sync add &lt;id&gt; &lt;path&gt;</code>.</p>
+    {% for folder in folders %}
+      <section class="folder">
+        <h2>{{ folder.name }} <span class="mono muted">{{ folder.id }}</span></h2>
+        <p class="muted">
+          Clients join with <code>omni-sync add {{ folder.id }}</code>, or the
+          wizard <code>omni-sync add</code>.
+        </p>
+        {% if folder.members.is_empty() %}
+          <p>No device holds this folder yet.</p>
+        {% else %}
+          <table>
+            <thead><tr><th>device</th><th>root</th><th>mode</th><th>lag</th></tr></thead>
+            <tbody>
+            {% for member in folder.members %}
+              <tr>
+                <td>{{ member.device_name }}</td>
+                <td class="mono">{{ member.root }}</td>
+                <td>{{ member.mode }}</td>
+                <td>
+                  {% if member.lag == 0 %}up to date{% else %}{{ member.lag }} behind{% endif %}
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        {% endif %}
+      </section>
+    {% endfor %}
   </main>
 </body>
 </html>

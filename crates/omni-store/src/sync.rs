@@ -251,6 +251,15 @@ pub fn manifest(conn: &Connection, folder_id: &str) -> Result<Vec<ActiveFile>, S
         .collect()
 }
 
+/// The highest op id in a folder: a member's `acked_seq` lags this.
+pub fn folder_head(conn: &Connection, folder_id: &str) -> Result<i64, StoreError> {
+    Ok(conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM ops WHERE folder_id = ?1",
+        [folder_id],
+        |row| row.get(0),
+    )?)
+}
+
 /// The op log tail, joined with the content each op produced.
 pub fn log_since(
     conn: &Connection,

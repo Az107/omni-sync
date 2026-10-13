@@ -27,9 +27,23 @@
 
     {% if let Some(code) = code %}
       <p class="notice">
-        Pairing code <strong>{{ code }}</strong> (valid 10 minutes). Enroll with:<br>
+        Pairing code <strong>{{ code }}</strong> — valid 10 minutes, usable once.<br>
+        Magic link (open it on the new machine):
+        <a id="magic-link" href="enroll?code={{ code }}">enroll</a>
+        <br><code id="magic-url" class="mono"></code>
+      </p>
+      <p class="muted">
+        Or by hand:
         <code>omni-sync enroll --server &lt;url&gt; --code {{ code }}</code>
       </p>
+      <script>
+        (function () {
+          var base = location.origin + location.pathname.replace(/devices\/?$/, "");
+          var url = base + "enroll?code={{ code }}";
+          document.getElementById("magic-link").href = url;
+          document.getElementById("magic-url").textContent = url;
+        })();
+      </script>
     {% endif %}
 
     <table>

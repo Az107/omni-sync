@@ -20,6 +20,14 @@ Still open: **M5** (client `history`/`resolve`/`flush` commands, chunk
 GC, membership enforcement, `notify`-driven wakeup, TLS deploy to the
 VPS).
 
+**M6 (onboarding + updates) is built** — see the M6 section below. The
+dashboard mints a magic link, `omni-sync enroll --link` opens a loopback
+listener and the browser hands it the code, `omni-sync add` is a wizard
+that lists the server's folders and completes paths, and both binaries
+ship `update`, which verifies a release against its `SHA256SUMS` before
+installing. Folder membership is now recorded (`members`) and shown on
+the dashboard; it is still not *enforced*.
+
 ## Answers folded in (2026-10-10)
 
 1. **Rust workspace, two binaries.**
@@ -160,9 +168,12 @@ under `/api/v1`, session cookie for the human dashboard.
 
 ```
 POST /devices/enroll            {code} → {device_id, token}   (one-time code, TTL)
+GET  /enroll                    public: enrollment landing page; with ?cb= and a
+                                loopback host it 303s the code back to the client
 GET/POST /devices               list / revoke (dashboard)
 POST /folders                   {name, retention, encrypted}
 POST /folders/{id}/members      {device_id, root_path, mode}
+GET  /folders/{id}/members      members with device names (dashboard)
 GET  /folders/{id}/manifest     file states (first sync / drift check)
 POST /folders/{id}/ops          submit ops [{base_seq, kind, path, ...}]
 GET  /folders/{id}/ops?since=N  tail of the log, ordered, idempotent
@@ -173,6 +184,11 @@ GET  /chunks/{hash}             stream download; Range for resume
 GET  /overwrites?since=N        review queue (superseded versions)
 GET  /events                    activity feed
 ```
+
+`POST /folders/{id}/members` infers the device from the bearer token, so a
+client registers its own root; the `device_id` field is dashboard-only.
+Adding these endpoints is backward-compatible, so `PROTOCOL_VERSION` is
+unchanged.
 
 Idempotency on `id`/`hash` everywhere: a client that crashed after
 applying an op but before recording it just replays. A version commits
@@ -331,15 +347,18 @@ toolchain (1.88) is below the workspace floor and cannot build it.
 
 ```
 omni-sync-server init|serve|pair|doctor   # init writes config, prompts dashboard password
-omni-sync enroll --server https://sync.albruiz.dev --code XXXX
+omni-sync-server folder create|list       # manage shared folders
+omni-sync-server update [--check] [--force] [--to <tag>] [--download-only <dir>]
+omni-sync enroll --link '<magic link>'    # browser handoff; or --server/--code
+omni-sync add [<folder> [<path>]]         # wizard when args are omitted
 omni-sync folders                        # folders, membership, applied_seq, device lag
-omni-sync add <folder> <local-path> [--mode]
 omni-sync daemon                         # the watcher/agent (systemd per device)
 omni-sync status [--folder]                     # held files shown with the reason
 omni-sync history <folder> <path>        # version chain
 omni-sync resolve <folder> <path> --to <version>   # rollback from the CLI too
 omni-sync flush [folder] [path]          # override a hold, sync now
 omni-sync doctor                         # server reachability, store, scan lag
+omni-sync update [--check] [--force] [--to <tag>]
 ```
 
 Dashboard (HTMX partials from askama templates, no SPA, no Tauri): Login · Overview (devices
@@ -365,8 +384,28 @@ versions: diff for text, magic-byte preview for images, metadata card and
   quota, `fsck`/repair, systemd units, Traefik + LE on the VPS, install
   and release, verified **from outside** over the public URL (the
   space-elevator rule: green tests have hidden broken deploys).
+- **M6 onboarding + updates** (built):
+  - **Magic-link enrollment.** The dashboard shows a link
+    `<server>/enroll?code=…`. `omni-sync enroll --link '<link>'` binds a
+    loopback listener and opens a browser; the public `/enroll` page
+    redirects the browser back to the listener (host validated to
+    loopback, nonce-checked), which enrolls and writes the config. The
+    `--server`/`--code` path and a prompt wizard both still work.
+  - **Folder-add wizard.** `omni-sync add` with no arguments lists the
+    server's folders (`Select`) and prompts for a local root with
+    filesystem path completion; it then records membership on the
+    server. Non-interactive flags are unchanged.
+  - **Membership.** `members` (which existed unused) now has
+    `POST/GET /api/v1/folders/{id}/members`; the dashboard shows each
+    folder's devices, roots and lag. Still recorded, not enforced.
+  - **Updates.** `omni-sync update` and `omni-sync-server update` query
+    GitHub Releases, pick the asset for the compiled-in target, verify
+    it against the release's `SHA256SUMS`, and install it atomically.
+    Releases publish bare binaries alongside the archives. The server
+    container runs `docker-entrypoint.sh`, which prefers a binary staged
+    on the `/state` volume by `update --download-only /state/bin`.
 - **Later**: direct client↔client transfer, per-folder convergent
-  encryption, bandwidth caps, more OSes.
+  encryption, bandwidth caps, more OSes, signed releases.
 
 ## Acceptance
 

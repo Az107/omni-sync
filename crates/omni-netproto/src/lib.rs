@@ -173,6 +173,34 @@ pub struct FoldersResponse {
     pub folders: Vec<FolderDto>,
 }
 
+/// A device telling the server which folder it holds and where. `root_path`
+/// is base64 of raw path bytes, like every other path on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterMemberRequest {
+    pub root_path: String,
+    #[serde(default = "default_member_mode")]
+    pub mode: String,
+}
+
+fn default_member_mode() -> String {
+    "both".to_string()
+}
+
+/// One folder membership, as the server reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemberDto {
+    pub device_id: String,
+    pub device_name: String,
+    pub root_path: String,
+    pub mode: String,
+    pub acked_seq: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MembersResponse {
+    pub members: Vec<MemberDto>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkPutResponse {
     /// True when the bytes were newly stored, false when already present.
@@ -208,5 +236,13 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: EnrollRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    #[test]
+    fn a_register_member_defaults_to_both() {
+        let request: RegisterMemberRequest =
+            serde_json::from_str(r#"{"root_path":"L2hvbWUvbWUvRG9jcw=="}"#).unwrap();
+        assert_eq!(request.mode, "both");
+        assert_eq!(request.root_path, "L2hvbWUvbWUvRG9jcw==");
     }
 }

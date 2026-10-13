@@ -11,15 +11,23 @@ description = "The omni-sync client CLI and daemon"
 anyhow.workspace = true
 clap.workspace = true
 directories.workspace = true
+hex.workspace = true
+inquire.workspace = true
 omni-agent.workspace = true
 omni-netproto.workspace = true
 omni-store.workspace = true
 omni-transfer.workspace = true
+omni-update.workspace = true
+opener.workspace = true
+rand.workspace = true
 serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "omni-sync"

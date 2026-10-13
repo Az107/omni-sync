@@ -6,8 +6,8 @@
 
 use omni_netproto::{
     ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
-    FoldersResponse, ManifestResponse, OpDto, OpsResponse, PROTOCOL_VERSION, SubmitOpsRequest,
-    SubmitOpsResponse,
+    FoldersResponse, ManifestResponse, MembersResponse, OpDto, OpsResponse, PROTOCOL_VERSION,
+    RegisterMemberRequest, SubmitOpsRequest, SubmitOpsResponse,
 };
 use reqwest::{RequestBuilder, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -93,6 +93,40 @@ impl Client {
         let url = self.endpoint("/api/v1/folders")?;
         let response: FoldersResponse = json(self.auth(self.http.get(url)).send().await?).await?;
         Ok(response.folders)
+    }
+
+    /// Tell the server this device holds a folder at a root. `root_path` is raw
+    /// bytes; it is base64-encoded for the wire.
+    pub async fn register_member(
+        &self,
+        folder_id: &str,
+        root_path: &[u8],
+        mode: &str,
+    ) -> Result<(), TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}/members"))?;
+        let request = self.auth(self.http.post(url)).json(&RegisterMemberRequest {
+            root_path: omni_netproto::encode_path(root_path),
+            mode: mode.to_owned(),
+        });
+        let response = request.send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(TransferError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn list_members(
+        &self,
+        folder_id: &str,
+    ) -> Result<Vec<omni_netproto::MemberDto>, TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}/members"))?;
+        let response: MembersResponse = json(self.auth(self.http.get(url)).send().await?).await?;
+        Ok(response.members)
     }
 
     pub async fn manifest(&self, folder_id: &str) -> Result<ManifestResponse, TransferError> {

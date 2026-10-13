@@ -17,6 +17,7 @@ omni-core = { path = "crates/omni-core", version = "0.1.0" }
 omni-netproto = { path = "crates/omni-netproto", version = "0.1.0" }
 omni-store = { path = "crates/omni-store", version = "0.1.0" }
 omni-transfer = { path = "crates/omni-transfer", version = "0.1.0" }
+omni-update = { path = "crates/omni-update", version = "0.1.0" }
 
 # External. Versions are the ones the `imp` workspace already builds on this
 # host, so most are warm in the registry cache.
@@ -34,13 +35,16 @@ base64 = "0.22"
 clap = { version = "4.6", features = ["derive"] }
 directories = "6.0"
 hex = "0.4"
+inquire = "0.7"
 notify = "8"
+opener = "0.7"
 rand = "0.9"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rust-embed = "8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+semver = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "2.0"

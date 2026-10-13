@@ -12,18 +12,19 @@ use serde::Deserialize;
 use omni_core::{Op, OpKind};
 use omni_netproto::{
     AppliedOpDto, ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
-    FoldersResponse, HealthResponse, LogEntryDto, ManifestEntryDto, ManifestResponse, OpKindDto,
-    OpsResponse, OverwriteDto, PROTOCOL_VERSION, ResolveRequest, SubmitOpsRequest,
-    SubmitOpsResponse,
+    FoldersResponse, HealthResponse, LogEntryDto, ManifestEntryDto, ManifestResponse, MemberDto,
+    MembersResponse, OpKindDto, OpsResponse, OverwriteDto, PROTOCOL_VERSION, RegisterMemberRequest,
+    ResolveRequest, SubmitOpsRequest, SubmitOpsResponse,
 };
 use omni_store::sync::{self, ActiveFile, LogEntry, OverwriteRow};
-use omni_store::{StoreError, devices, folders, pairing};
+use omni_store::{StoreError, devices, folders, members, pairing};
 
 use crate::auth;
 use crate::chunkstore::ChunkError;
 use crate::state::AppState;
 use crate::templates::{
-    Dashboard, DeviceView, Devices, FolderView, Folders, Login, OverwriteView, Overwrites,
+    Dashboard, DeviceView, Devices, Enroll, FolderView, Folders, Login, MemberView, OverwriteView,
+    Overwrites,
 };
 
 /// The dashboard session cookie name.
@@ -41,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(dashboard))
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout))
+        .route("/enroll", get(enroll_page))
         .route("/static/{*path}", get(static_asset))
         // Dashboard pages.
         .route("/devices", get(devices_page))
@@ -53,6 +55,10 @@ pub fn router(state: AppState) -> Router {
         // Folders.
         .route("/api/v1/folders", post(create_folder).get(list_folders))
         .route("/api/v1/folders/{id}/manifest", get(manifest))
+        .route(
+            "/api/v1/folders/{id}/members",
+            post(register_member).get(list_members),
+        )
         .route("/api/v1/folders/{id}/ops", post(submit_ops).get(list_ops))
         .route("/api/v1/folders/{id}/resolve", post(resolve))
         .route("/api/v1/overwrites", get(list_overwrites))
@@ -237,15 +243,37 @@ async fn folders_page(
         return Ok(Redirect::to("/login").into_response());
     }
     let folders = state.store.blocking(folders::list).await?;
+    let mut views = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let id = folder.id.clone();
+        let head = state
+            .store
+            .blocking(move |conn| sync::folder_head(conn, &id))
+            .await?;
+        let lookup = folder.id.clone();
+        let members = state
+            .store
+            .blocking(move |conn| members::list(conn, &lookup))
+            .await?;
+        views.push(FolderView {
+            id: folder.id,
+            name: folder.name,
+            head_seq: head,
+            members: members
+                .into_iter()
+                .map(|member| MemberView {
+                    device_name: member.device_name,
+                    root: display_path(&member.root_path),
+                    mode: member.mode,
+                    acked_seq: member.acked_seq,
+                    lag: (head - member.acked_seq).max(0),
+                })
+                .collect(),
+        });
+    }
     let page = Folders {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        folders: folders
-            .into_iter()
-            .map(|folder| FolderView {
-                id: folder.id,
-                name: folder.name,
-            })
-            .collect(),
+        folders: views,
     };
     Ok(Html(page.render()?).into_response())
 }
@@ -423,6 +451,88 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
 // ---- enrollment ------------------------------------------------------------
 
+#[derive(Deserialize)]
+struct EnrollQuery {
+    #[serde(default)]
+    code: Option<String>,
+    /// A loopback callback the browser should be handed to, e.g.
+    /// `http://127.0.0.1:49152`.
+    #[serde(default)]
+    cb: Option<String>,
+    /// An opaque nonce the client checks, to defeat a random page POSTing a
+    /// code to the loopback listener.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// The public enrollment landing page (`GET /enroll`).
+///
+/// With `code` + a loopback `cb`, this is a plain redirect: the browser hands
+/// the one-time code to the client's listener, which is the whole point of the
+/// magic link. Otherwise it renders instructions. The pairing code *is* the
+/// secret here, so there is no session check; the code is single-use and TTL'd.
+async fn enroll_page(Query(query): Query<EnrollQuery>) -> Result<Response, AppError> {
+    if let (Some(code), Some(cb)) = (&query.code, &query.cb)
+        && is_loopback_callback(cb)
+    {
+        let separator = if cb.contains('?') { '&' } else { '?' };
+        let mut target = format!("{cb}{separator}code={}", percent_encode(code));
+        if let Some(state) = &query.state {
+            target.push_str("&state=");
+            target.push_str(&percent_encode(state));
+        }
+        return Ok(Redirect::to(&target).into_response());
+    }
+
+    let page = Enroll {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        code: query.code,
+        releases_url: format!("{}/releases/latest", env!("CARGO_PKG_REPOSITORY")),
+    };
+    let mut response = Html(page.render()?).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+        ),
+    );
+    Ok(response)
+}
+
+/// Only ever redirect to a loopback callback. A browser treats
+/// `http://127.0.0.1` and `http://localhost` as trustworthy, so this is the
+/// one host an HTTPS page may hand off to; anything else would be an open
+/// redirect.
+fn is_loopback_callback(cb: &str) -> bool {
+    if cb.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"]
+        .iter()
+        .any(|prefix| cb.starts_with(prefix))
+}
+
+/// Percent-encode everything outside the RFC 3986 unreserved set. Used for the
+/// code and nonce in a redirect target, where an unescaped `&` or CRLF would be
+/// an injection.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{byte:02X}"));
+        }
+    }
+    out
+}
+
 async fn enroll(
     State(state): State<AppState>,
     Json(request): Json<EnrollRequest>,
@@ -533,6 +643,48 @@ async fn list_folders(
     let folders = state.store.blocking(folders::list).await?;
     Ok(Json(FoldersResponse {
         folders: folders.iter().map(folder_dto).collect(),
+    }))
+}
+
+/// A device registers (or moves) its root for a folder.
+async fn register_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+    Json(request): Json<RegisterMemberRequest>,
+) -> Result<Json<MemberDto>, AppError> {
+    let device = authenticate(&state, &headers).await?;
+    let root_path = omni_netproto::decode_path(&request.root_path)
+        .map_err(|_| AppError::BadRequest("root_path is not valid base64".into()))?;
+
+    let folder = folder_id.clone();
+    let device_id = device.id.clone();
+    let mode = request.mode;
+    let member = state
+        .store
+        .blocking(move |conn| {
+            members::upsert(conn, &folder, &device_id, &root_path, &mode)?;
+            members::list(conn, &folder)
+        })
+        .await?
+        .into_iter()
+        .find(|member| member.device_id == device.id)
+        .ok_or_else(|| AppError::Internal("member vanished after upsert".into()))?;
+    Ok(Json(member_dto(member)))
+}
+
+async fn list_members(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+) -> Result<Json<MembersResponse>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    let members = state
+        .store
+        .blocking(move |conn| members::list(conn, &folder_id))
+        .await?;
+    Ok(Json(MembersResponse {
+        members: members.into_iter().map(member_dto).collect(),
     }))
 }
 
@@ -709,6 +861,16 @@ fn folder_dto(folder: &folders::Folder) -> FolderDto {
     }
 }
 
+fn member_dto(member: members::Member) -> MemberDto {
+    MemberDto {
+        device_id: member.device_id,
+        device_name: member.device_name,
+        root_path: omni_netproto::encode_path(&member.root_path),
+        mode: member.mode,
+        acked_seq: member.acked_seq,
+    }
+}
+
 fn entry_dto(file: ActiveFile) -> ManifestEntryDto {
     ManifestEntryDto {
         path: omni_netproto::encode_path(&file.path),
@@ -834,5 +996,23 @@ mod tests {
         assert_eq!(display_path(b"notes/todo.md"), "notes/todo.md");
         // A non-UTF-8 byte becomes the replacement character, not an error.
         assert!(display_path(&[0xff, b'a']).ends_with('a'));
+    }
+
+    #[test]
+    fn only_loopback_callbacks_are_accepted() {
+        assert!(is_loopback_callback("http://127.0.0.1:51234"));
+        assert!(is_loopback_callback("http://localhost:8080"));
+        assert!(is_loopback_callback("http://[::1]:9"));
+        // A redirect to any other host would be an open redirect.
+        assert!(!is_loopback_callback("https://evil.example/"));
+        assert!(!is_loopback_callback("http://10.0.0.5:80"));
+        assert!(!is_loopback_callback("http://127.0.0.1:80\r\nX: y"));
+    }
+
+    #[test]
+    fn percent_encoding_neutralises_injection() {
+        assert_eq!(percent_encode("ABCD-EFGHJ"), "ABCD-EFGHJ");
+        assert_eq!(percent_encode("a b&c"), "a%20b%26c");
+        assert_eq!(percent_encode("\r\n"), "%0D%0A");
     }
 }

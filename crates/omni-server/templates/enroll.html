@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>omni-sync · enroll a device</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="bar">
+    <span class="brand">omni-sync</span>
+    <nav></nav>
+  </header>
+
+  <main>
+    <h1>Enroll a device</h1>
+    <p class="muted">server {{ version }}</p>
+
+    {% if let Some(code) = code %}
+      <p class="notice">
+        Pairing code <strong>{{ code }}</strong> — valid for 10 minutes and
+        usable once.
+      </p>
+    {% else %}
+      <p class="error">
+        This link has no pairing code. Open <em>devices → add a device</em>
+        on the dashboard to mint one.
+      </p>
+    {% endif %}
+
+    <section>
+      <h2>1. Install the client</h2>
+      <p>Download the build for this computer and put it on your <code>PATH</code>:</p>
+      <p>
+        <a href="{{ releases_url }}">latest releases</a>
+      </p>
+      <p class="muted">
+        Linux x86_64, macOS (Apple silicon and Intel) and Windows (x64 and
+        arm64) are published as <code>omni-sync-&lt;version&gt;-&lt;target&gt;</code>.
+      </p>
+    </section>
+
+    <section>
+      <h2>2. Enroll this computer</h2>
+      {% if code.is_some() %}
+        <p>
+          Copy this page's address from the browser bar and run:
+        </p>
+        <pre class="cmd">omni-sync enroll --link '&lt;paste this page's URL&gt;'</pre>
+        <p>Or enroll by hand, supplying the server URL and the code:</p>
+        <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code &lt;code above&gt;</pre>
+      {% else %}
+        <p>Once you have a link with a code, run:</p>
+        <pre class="cmd">omni-sync enroll --link '&lt;the link from the dashboard&gt;'</pre>
+      {% endif %}
+    </section>
+
+    <section>
+      <h2>3. Watch a folder</h2>
+      <pre class="cmd">omni-sync add</pre>
+      <p class="muted">
+        The wizard lists the server's shared folders and asks for a local path.
+      </p>
+    </section>
+  </main>
+</body>
+</html>

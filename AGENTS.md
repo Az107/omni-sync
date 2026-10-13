@@ -38,6 +38,16 @@ scans, pushes ops+chunks and applies the pulled log.
 subcommands still print their milestone; there is no chunk GC and no
 per-folder membership enforcement. See "Known gaps".
 
+**M6 (onboarding + updates) is built.** The dashboard mints a magic link
+(`/enroll?code=…`); `omni-sync enroll --link '<link>'` binds a loopback
+listener and opens a browser so the server page hands the one-time code
+back to the client. `omni-sync add` with no arguments is a wizard that
+selects a server folder and completes a local path, then records
+membership on the server (the `members` table is now used). Both
+binaries have `update`, which picks the release asset for the
+compiled-in target, verifies it against the release's `SHA256SUMS`, and
+installs it atomically; releases publish bare binaries for that purpose.
+
 **Change detection is watcher-driven.** Push runs on `notify` events
 (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan; pull
 runs on a 2 s timer because remote changes are not filesystem events.
@@ -61,6 +71,9 @@ cargo run -p omni-server -- doctor
 
 # client
 cargo run -p omni-cli -- enroll --server http://127.0.0.1:8787 --code ABCD-EFGHJ
+cargo run -p omni-cli -- enroll --link 'http://127.0.0.1:8787/enroll?code=ABCD-EFGHJ'  # browser handoff
+cargo run -p omni-cli -- add            # wizard: pick a folder, complete a path
+cargo run -p omni-cli -- update --check # is a newer release out?
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
@@ -73,8 +86,13 @@ Release matrix — the client ships for six targets, the server for one:
 
 | package | targets |
 |---|---|
-| `omni-sync` (client) | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
+| `omni-sync` (client) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (native arm64 runner), `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
 | `omni-sync-server` | `x86_64-unknown-linux-gnu` (it ships as a container off the same tree) |
+
+`ubuntu-24.04-arm` is a GitHub-hosted arm64 Linux runner (free for public
+repos), so `aarch64-unknown-linux-gnu` is native rather than cross-built.
+The release also publishes bare binaries (not just the archives), which is
+what `omni-sync update` downloads; both are covered by `SHA256SUMS`.
 
 `Swatinem/rust-cache` is keyed per target *and* package (`key: <target>-
 <package>`); the default job-based key is shared by every matrix entry, so
@@ -153,6 +171,18 @@ twice returns `400 invalid, expired or already-used pairing code`.
   must be in scope where you call it, not only where the struct is
   defined.
 - **axum 0.8 catch-all routes are `{*path}`**, not `/*path`.
+- **`omni-update` derives the target triple from `build.rs`** (which
+  re-emits the build script's `TARGET` as `OMNI_TARGET`). Asset selection
+  therefore matches `.github/workflows/release.yml` exactly; there is no
+  runtime OS/arch table to drift. Updates verify against the release's
+  `SHA256SUMS` only — no signature yet.
+- **The server container runs `docker-entrypoint.sh`**, which prefers a
+  binary on the `/state` volume (`update --download-only /state/bin`)
+  over the one baked into the image. That is what makes a self-update
+  survive a redeploy; delete the staged file to fall back to the image.
+- **CLI prompts only when stdin is a TTY.** `omni-sync enroll`/`add`
+  become wizards on a terminal and demand flags otherwise, so scripts and
+  CI are unaffected.
 - **Config never holds a secret.** The dashboard password is an Argon2
   PHC string; device tokens are stored only as SHA-256
   (`auth::hash_token`). Files under the state dir are opened `0600`.
@@ -230,8 +260,10 @@ deployment works unchanged.
   stubs.
 - **Move ops are refused** (`StoreError::Unsupported`); a rename is a
   delete + put at the client. The op kind exists in the schema.
-- **Per-folder membership is not enforced.** Any enrolled device may read
-  or write any folder. `members` exists but is unused.
+- **Per-folder membership is not enforced.** Any enrolled device may
+  read or write any folder. Membership is now *recorded* (`members`, via
+  `POST /api/v1/folders/{id}/members`) and shown on the dashboard, but
+  the server does not check it on read or write.
 - The dashboard covers overview, devices (with pairing codes), folders
   and overwrites (with *restore older*). It is plain form posts, no HTMX
   yet, and there is no per-file history view.

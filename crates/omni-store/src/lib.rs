@@ -9,6 +9,7 @@
 pub mod agent;
 pub mod devices;
 pub mod folders;
+pub mod members;
 pub mod migrations;
 pub mod pairing;
 pub mod sync;

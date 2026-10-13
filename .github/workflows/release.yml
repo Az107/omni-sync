@@ -32,7 +32,9 @@ jobs:
       matrix:
         include:
           # Client — linux, macOS and Windows, arm64 and x64.
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  package: omni-cli,    bin: omni-sync,        native: true }
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  package: omni-cli,    bin: omni-sync,        native: true }
+          # Native arm64 Linux runner (free for public repos): no cross toolchain.
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, package: omni-cli,    bin: omni-sync,        native: true }
           - { os: macos-latest,   target: aarch64-apple-darwin,      package: omni-cli,    bin: omni-sync,        native: true }
           - { os: macos-latest,   target: x86_64-apple-darwin,       package: omni-cli,    bin: omni-sync,        native: false }
           - { os: windows-latest, target: aarch64-pc-windows-msvc,   package: omni-cli,    bin: omni-sync,        native: false }
@@ -74,7 +76,11 @@ jobs:
           stage="$(mktemp -d)"
           install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
           tar -C "$stage" -czf "${name}.tar.gz" "${{ matrix.bin }}"
+          # The bare binary is what the self-updater downloads; it needs no
+          # archive extraction. Both are published and checksummed.
+          install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${name}"
           echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+          echo "ASSET_BARE=${name}" >> "$GITHUB_ENV"
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -83,12 +89,16 @@ jobs:
           $name = "${{ matrix.bin }}-$($env:TAG -replace '^v','')-${{ matrix.target }}"
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}.exe" `
             -DestinationPath "$name.zip"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}.exe" "$name.exe"
           "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ASSET_BARE=$name.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.bin }}-${{ matrix.target }}
-          path: ${{ env.ASSET }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET_BARE }}
           if-no-files-found: error
 
   publish:
@@ -105,7 +115,9 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          # Covers the bare self-updater binaries, the archives and the Windows
+          # zips. SHA256SUMS does not exist yet, so the glob cannot include it.
+          sha256sum * > SHA256SUMS
 
       - name: Create or update the release
         env:

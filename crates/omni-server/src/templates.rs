@@ -42,6 +42,28 @@ pub struct Folders {
 pub struct FolderView {
     pub id: String,
     pub name: String,
+    /// The op-log head this folder is at; members lag behind it.
+    pub head_seq: i64,
+    pub members: Vec<MemberView>,
+}
+
+pub struct MemberView {
+    pub device_name: String,
+    pub root: String,
+    pub mode: String,
+    pub acked_seq: i64,
+    pub lag: i64,
+}
+
+/// The public enrollment landing page (`GET /enroll`).
+#[derive(Template)]
+#[template(path = "enroll.html")]
+pub struct Enroll {
+    pub version: String,
+    pub code: Option<String>,
+    /// Where to download a client build, e.g.
+    /// `https://github.com/<owner>/<repo>/releases/latest`.
+    pub releases_url: String,
 }
 
 #[derive(Template)]

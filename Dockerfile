@@ -20,6 +20,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/omni-sync-server /usr/local/bin/omni-sync-server
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Data (chunks) and state (SQLite) live on volumes, not the container layer.
 #
@@ -34,5 +36,5 @@ ENV OMNI_SYNC_ADDR=0.0.0.0:80 \
 RUN mkdir -p /data /state
 VOLUME ["/data", "/state"]
 EXPOSE 80
-ENTRYPOINT ["/usr/local/bin/omni-sync-server"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["serve"]

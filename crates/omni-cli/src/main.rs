@@ -1,11 +1,17 @@
 //! The `omni-sync` client binary.
 //!
-//! `enroll` registers the device; `add` records a folder to watch; `daemon`
-//! runs the watcher/sync loop for every recorded folder.
+//! `enroll` registers the device (by pairing code or magic link); `add` records
+//! a folder to watch; `daemon` runs the watcher/sync loop for every recorded
+//! folder; `update` installs a newer release from GitHub.
 
+mod link;
+mod wizard;
+
+use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use anyhow::{Context as _, anyhow};
+use anyhow::{Context as _, anyhow, bail};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
 use omni_agent::{Engine, EngineConfig};
@@ -28,22 +34,35 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register this device with a server using a one-time pairing code.
+    /// Register this device. Prompt-free with --server/--code or --link.
     Enroll {
+        /// Server base URL, e.g. https://sync.example.com (or .../app/omni-sync).
         #[arg(long)]
-        server: String,
+        server: Option<String>,
+        /// One-time pairing code from the dashboard.
         #[arg(long)]
-        code: String,
-        /// A human label for this device.
-        #[arg(long, default_value = "device")]
-        name: String,
+        code: Option<String>,
+        /// Magic link from the dashboard; opens a browser and takes the code.
+        #[arg(long)]
+        link: Option<String>,
+        /// A human label for this device. Defaults to the hostname.
+        #[arg(long)]
+        name: Option<String>,
+        /// With --link, enroll directly instead of opening a browser.
+        #[arg(long)]
+        no_browser: bool,
+        /// Seconds to wait for the browser to finish enrolling.
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
     },
-    /// Watch a shared folder (by id) at a local path.
+    /// Watch a shared folder (by id) at a local path. Prompts if args are omitted.
     Add {
-        folder: String,
-        path: PathBuf,
-        #[arg(long, default_value = "live")]
-        mode: String,
+        /// Folder id from `omni-sync folders`; prompted for if omitted.
+        folder: Option<String>,
+        /// Local directory to watch; prompted for if omitted.
+        path: Option<PathBuf>,
+        #[arg(long)]
+        mode: Option<String>,
     },
     /// Run the watcher/sync daemon.
     Daemon,
@@ -53,6 +72,18 @@ enum Command {
     Status,
     /// Print the resolved config and store status.
     Doctor,
+    /// Install a newer release from GitHub.
+    Update {
+        /// Only report whether a newer release exists.
+        #[arg(long)]
+        check: bool,
+        /// Reinstall the release even if this binary is already current.
+        #[arg(long)]
+        force: bool,
+        /// A specific release tag (e.g. v0.2.0) instead of the latest.
+        #[arg(long)]
+        to: Option<String>,
+    },
     /// Print the version chain for a file.
     History { folder: String, path: String },
     /// Roll a path back to a version.
@@ -104,12 +135,31 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .unwrap_or_else(|| client_config_path(None));
     match cli.command {
-        Command::Enroll { server, code, name } => enroll(&config_path, &server, &code, &name).await,
-        Command::Add { folder, path, mode } => add(&config_path, &folder, &path, &mode),
+        Command::Enroll {
+            server,
+            code,
+            link,
+            name,
+            no_browser,
+            timeout,
+        } => {
+            enroll(
+                &config_path,
+                server,
+                code,
+                link,
+                name,
+                no_browser,
+                Duration::from_secs(timeout),
+            )
+            .await
+        }
+        Command::Add { folder, path, mode } => add(&config_path, folder, path, mode).await,
         Command::Daemon => daemon(&config_path).await,
         Command::Folders => folders(&config_path).await,
         Command::Status => status(&config_path),
         Command::Doctor => doctor(&config_path).await,
+        Command::Update { check, force, to } => update(check, force, to).await,
         Command::History { .. } | Command::Resolve { .. } | Command::Flush { .. } => {
             println!("not implemented yet — it lands in M5 (see plan.md).");
             Ok(())
@@ -117,12 +167,70 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn enroll(config_path: &Path, server: &str, code: &str, name: &str) -> anyhow::Result<()> {
-    let client = omni_transfer::Client::new(server)?;
-    let response = client.enroll(name, code).await?;
+/// True when we may prompt: a terminal on stdin, and not asked to be quiet.
+fn interactive() -> bool {
+    std::io::stdin().is_terminal()
+}
+
+/// A sensible default device name.
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|name| name.trim().to_string())
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "device".to_string())
+}
+
+async fn enroll(
+    config_path: &Path,
+    server: Option<String>,
+    code: Option<String>,
+    link: Option<String>,
+    name: Option<String>,
+    no_browser: bool,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    // A magic link carries both the server and the code; the loopback handoff
+    // resolves the code before we enroll.
+    let via_link = link.is_some();
+    let (server, code) = if let Some(link) = link {
+        let resolved = self::link::resolve(&link, no_browser, timeout).await?;
+        (resolved.server, resolved.code)
+    } else {
+        match (server, code) {
+            (Some(server), Some(code)) => (server, code),
+            (server, code) if interactive() => {
+                let server = match server {
+                    Some(server) => server,
+                    None => wizard::prompt("Server URL", None)?,
+                };
+                let code = match code {
+                    Some(code) => code,
+                    None => wizard::prompt("Pairing code", None)?,
+                };
+                (server, code)
+            }
+            _ => bail!("--server and --code (or --link) are required when not on a terminal"),
+        }
+    };
+
+    let name = match name {
+        Some(name) => name,
+        // A magic-link enrollment should be hands-off: no prompt after the
+        // browser handoff, just the hostname.
+        None if interactive() && !via_link => wizard::prompt("Device name", Some(&hostname()))?,
+        None => hostname(),
+    };
+
+    let client = omni_transfer::Client::new(&server)?;
+    let response = client.enroll(&name, &code).await?;
 
     let config = ClientConfig {
-        server: server.to_string(),
+        server,
         device_id: response.device_id.clone(),
         token: response.token,
         folders: Vec::new(),
@@ -130,25 +238,142 @@ async fn enroll(config_path: &Path, server: &str, code: &str, name: &str) -> any
     save_config(config_path, &config)?;
     println!("enrolled as device {}", config.device_id);
     println!("config written to {}", config_path.display());
+    println!("next: `omni-sync add` to pick a folder to watch.");
     Ok(())
 }
 
-fn add(config_path: &Path, folder: &str, path: &Path, mode: &str) -> anyhow::Result<()> {
+async fn add(
+    config_path: &Path,
+    folder: Option<String>,
+    path: Option<PathBuf>,
+    mode: Option<String>,
+) -> anyhow::Result<()> {
     let mut config = load_config(config_path)?;
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("resolving {}", path.display()))?;
-    if !path.is_dir() {
-        return Err(anyhow!("{} is not a directory", path.display()));
+    let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+
+    // Which server folder?
+    let folder_id = match folder {
+        Some(folder) => folder,
+        None if interactive() => {
+            let folders = client.list_folders().await?;
+            wizard::select_folder(&folders)?
+        }
+        None => bail!(
+            "a folder id is required when not on a terminal; run `omni-sync folders` or pass one"
+        ),
+    };
+
+    // Which local directory?
+    let path = match path {
+        Some(path) => path,
+        None if interactive() => wizard::prompt_path("Local directory to watch")?,
+        None => bail!("a local path is required when not on a terminal"),
+    };
+    let path = prepare_path(&path, interactive())?;
+
+    let mode = match mode {
+        Some(mode) => mode,
+        None if interactive() => {
+            if wizard::confirm("Sync in live mode? (no = on_close)", true)? {
+                "live".to_string()
+            } else {
+                "on_close".to_string()
+            }
+        }
+        None => "live".to_string(),
+    };
+
+    if interactive()
+        && !wizard::confirm(
+            &format!(
+                "Watch folder {folder_id} at {} ({mode} mode)?",
+                path.display()
+            ),
+            true,
+        )?
+    {
+        println!("cancelled");
+        return Ok(());
     }
-    config.folders.retain(|entry| entry.folder_id != folder);
+
+    config.folders.retain(|entry| entry.folder_id != folder_id);
     config.folders.push(WatchEntry {
-        folder_id: folder.to_string(),
+        folder_id: folder_id.clone(),
         path: path.clone(),
-        mode: mode.to_string(),
+        mode: mode.clone(),
     });
     save_config(config_path, &config)?;
-    println!("watching folder {} at {}", folder, path.display());
+
+    // Record membership on the server (best effort: an older server may not
+    // know this endpoint, which must not stop the local add).
+    let root = path.as_os_str().as_encoded_bytes().to_vec();
+    if let Err(error) = client.register_member(&folder_id, &root, "both").await {
+        eprintln!("note: the server did not record this membership ({error})");
+    }
+
+    println!("watching folder {} at {}", folder_id, path.display());
+    Ok(())
+}
+
+/// Resolve a local path for `add`: expand `~`, canonicalize, and offer to
+/// create a missing directory when we can prompt.
+fn prepare_path(path: &Path, interactive: bool) -> anyhow::Result<PathBuf> {
+    let expanded = wizard::expand_tilde(&path.to_string_lossy());
+    if expanded.exists() {
+        let canonical = expanded
+            .canonicalize()
+            .with_context(|| format!("resolving {}", expanded.display()))?;
+        if !canonical.is_dir() {
+            bail!("{} is not a directory", canonical.display());
+        }
+        return Ok(canonical);
+    }
+    if interactive
+        && wizard::confirm(
+            &format!("{} does not exist; create it?", expanded.display()),
+            true,
+        )?
+    {
+        std::fs::create_dir_all(&expanded)
+            .with_context(|| format!("creating {}", expanded.display()))?;
+        return Ok(expanded.canonicalize()?);
+    }
+    bail!("{} does not exist", expanded.display())
+}
+
+/// `omni-sync update`: check GitHub Releases, verify against SHA256SUMS, install.
+async fn update(check: bool, force: bool, to: Option<String>) -> anyhow::Result<()> {
+    let binary = "omni-sync";
+    let target = omni_update::target();
+    let current = omni_update::current_version();
+    println!("current: {current} ({target})");
+
+    let plan = if force {
+        Some(omni_update::plan(binary, target, to.as_deref()).await?)
+    } else {
+        omni_update::check(binary, target, to.as_deref()).await?
+    };
+
+    let Some(plan) = plan else {
+        println!("up to date");
+        return Ok(());
+    };
+
+    println!(
+        "available: {} ({}), asset {}",
+        plan.release.version, plan.release.tag, plan.asset_name
+    );
+    if check {
+        return Ok(());
+    }
+
+    let destination = std::env::current_exe().context("locating the running binary")?;
+    println!("downloading and verifying…");
+    omni_update::apply(&plan, &destination).await?;
+    println!(
+        "updated {} -> {}; restart the daemon to use it",
+        plan.current, plan.release.version
+    );
     Ok(())
 }
 

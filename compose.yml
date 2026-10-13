@@ -12,6 +12,9 @@ services:
     # reaches for a host-published web app; do not hard-code a host port.
     ports:
       - "80"
+    # A self-update writes the verified binary to /state/bin and exits; the
+    # restart policy picks it up through docker-entrypoint.sh.
+    restart: unless-stopped
     volumes:
       - omnidata:/data
       - omnistate:/state
@@ -19,6 +22,9 @@ services:
       OMNI_SYNC_ADDR: "0.0.0.0:80"
       OMNI_SYNC_DATA_DIR: "/data"
       OMNI_SYNC_STATE_DIR: "/state"
+      # Needed only while the GitHub repo is private, for `omni-sync-server
+      # update` to read the release. Leave unset once the repo is public.
+      OMNI_SYNC_GITHUB_TOKEN: "${OMNI_SYNC_GITHUB_TOKEN:-}"
 
 volumes:
   omnidata:

@@ -19,6 +19,7 @@ omni-chunk.workspace = true
 omni-core.workspace = true
 omni-netproto.workspace = true
 omni-store.workspace = true
+omni-update.workspace = true
 rand.workspace = true
 rust-embed.workspace = true
 serde.workspace = true
