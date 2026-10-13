@@ -41,6 +41,23 @@ pub fn upsert(
     Ok(())
 }
 
+/// Record how far a member has acknowledged the log. Only ever moves forward,
+/// so a delayed or repeated pull cannot rewind it.
+pub fn set_acked(
+    conn: &Connection,
+    folder_id: &str,
+    device_id: &str,
+    seq: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE members
+            SET acked_seq = ?3
+          WHERE folder_id = ?1 AND device_id = ?2 AND acked_seq < ?3",
+        params![folder_id, device_id, seq],
+    )?;
+    Ok(())
+}
+
 /// Every member of a folder, oldest device first, with its device name.
 pub fn list(conn: &Connection, folder_id: &str) -> Result<Vec<Member>, StoreError> {
     let mut stmt = conn.prepare(
@@ -113,5 +130,25 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].root_path, b"/srv/Docs");
         assert_eq!(members[0].mode, "send");
+    }
+
+    #[test]
+    fn a_watermark_only_moves_forward() {
+        let store = crate::Store::open_in_memory().unwrap();
+        seed(&store);
+        store
+            .with(|conn| upsert(conn, "f1", "d1", b"/docs", "both"))
+            .unwrap();
+
+        store.with(|conn| set_acked(conn, "f1", "d1", 7)).unwrap();
+        assert_eq!(store.with(|conn| list(conn, "f1")).unwrap()[0].acked_seq, 7);
+
+        // A stale or repeated pull must not rewind the watermark.
+        store.with(|conn| set_acked(conn, "f1", "d1", 3)).unwrap();
+        assert_eq!(store.with(|conn| list(conn, "f1")).unwrap()[0].acked_seq, 7);
+
+        // Only advances.
+        store.with(|conn| set_acked(conn, "f1", "d1", 9)).unwrap();
+        assert_eq!(store.with(|conn| list(conn, "f1")).unwrap()[0].acked_seq, 9);
     }
 }

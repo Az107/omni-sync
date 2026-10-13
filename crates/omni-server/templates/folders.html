@@ -1,59 +1,29 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync · folders</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header class="bar">
-    <span class="brand">omni-sync</span>
-    <nav>
-      <a href="/">overview</a>
-      <a href="/devices">devices</a>
-      <a href="/folders">folders</a>
-      <a href="/overwrites">overwrites</a>
-    </nav>
-    <form method="post" action="/logout"><button type="submit">log out</button></form>
-  </header>
+{% extends "base.html" %}
+{% block title %}Folders · omni-sync{% endblock %}
+{% block body %}
+<div class="shell">
+  {% include "_rail.html" %}
+  <main class="main" id="content">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Folders</h1>
+        <p class="page-note">A folder is a set of paths kept identical across every device that holds it. The rail shows how far each device has acknowledged the change log.</p>
+      </div>
+      <form class="form-inline" method="post" action="/folders">
+        <input class="input" name="name" placeholder="New folder name" required>
+        <button class="btn btn-primary" type="submit">Create</button>
+      </form>
+    </div>
 
-  <main>
-    <h1>Folders</h1>
-
-    <form method="post" action="/folders" class="inline">
-      <input name="name" placeholder="folder name" required>
-      <button type="submit">Create</button>
-    </form>
-
-    {% for folder in folders %}
-      <section class="folder">
-        <h2>{{ folder.name }} <span class="mono muted">{{ folder.id }}</span></h2>
-        <p class="muted">
-          Clients join with <code>omni-sync add {{ folder.id }}</code>, or the
-          wizard <code>omni-sync add</code>.
-        </p>
-        {% if folder.members.is_empty() %}
-          <p>No device holds this folder yet.</p>
-        {% else %}
-          <table>
-            <thead><tr><th>device</th><th>root</th><th>mode</th><th>lag</th></tr></thead>
-            <tbody>
-            {% for member in folder.members %}
-              <tr>
-                <td>{{ member.device_name }}</td>
-                <td class="mono">{{ member.root }}</td>
-                <td>{{ member.mode }}</td>
-                <td>
-                  {% if member.lag == 0 %}up to date{% else %}{{ member.lag }} behind{% endif %}
-                </td>
-              </tr>
-            {% endfor %}
-            </tbody>
-          </table>
-        {% endif %}
-      </section>
-    {% endfor %}
+    {% if folders.is_empty() %}
+      <div class="empty">
+        <strong>No folders yet</strong>
+        Create one above, then run <code>omni-sync add</code> on a device to watch it.
+      </div>
+    {% else %}
+      {% let compact = false %}
+      {% for folder in folders %}{% include "_folder.html" %}{% endfor %}
+    {% endif %}
   </main>
-</body>
-</html>
+</div>
+{% endblock %}

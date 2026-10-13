@@ -89,3 +89,38 @@ pub fn touch(conn: &Connection, id: &str) -> Result<(), StoreError> {
     )?;
     Ok(())
 }
+
+/// A device plus how long ago it was last seen, computed in SQLite so no date
+/// parsing is needed on the Rust side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceSeen {
+    pub id: String,
+    pub name: String,
+    pub revoked: bool,
+    /// Seconds since the last contact; `None` means the device has never been seen.
+    pub seen_seconds: Option<i64>,
+}
+
+pub fn list_with_seen(conn: &Connection) -> Result<Vec<DeviceSeen>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, name, revoked_at IS NOT NULL,
+                CASE WHEN last_seen_at IS NULL THEN NULL
+                     ELSE CAST(strftime('%s', 'now') AS INTEGER)
+                          - CAST(strftime('%s', last_seen_at) AS INTEGER)
+                END
+           FROM devices ORDER BY enrolled_at",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok(DeviceSeen {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            revoked: row.get(2)?,
+            seen_seconds: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}

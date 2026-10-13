@@ -1,52 +1,58 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync · overwrites</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header class="bar">
-    <span class="brand">omni-sync</span>
-    <nav>
-      <a href="/">overview</a>
-      <a href="/devices">devices</a>
-      <a href="/folders">folders</a>
-      <a href="/overwrites">overwrites</a>
-    </nav>
-    <form method="post" action="/logout"><button type="submit">log out</button></form>
-  </header>
-
-  <main>
-    <h1>Overwrites</h1>
-    <p class="muted">
-      Last-write-wins kept the newer version. The older version is still stored,
-      so <em>restore older</em> puts it back on every device.
-    </p>
+{% extends "base.html" %}
+{% block title %}Overwrites · omni-sync{% endblock %}
+{% block body %}
+<div class="shell">
+  {% include "_rail.html" %}
+  <main class="main" id="content">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Overwrites</h1>
+        <p class="page-note">Two devices changed the same file while apart. The newer version is active; the other is still stored, and restoring it brings every device in line.</p>
+      </div>
+    </div>
 
     {% if rows.is_empty() %}
-      <p>Nothing to review.</p>
+      <div class="empty">
+        <strong>Nothing to review</strong>
+        Overwrites appear here only when two devices edit the same path while they are not in sync.
+      </div>
     {% else %}
-      <table>
-        <thead><tr><th>path</th><th>folder</th><th>kept</th><th>superseded</th><th></th></tr></thead>
-        <tbody>
-        {% for row in rows %}
-          <tr>
-            <td class="mono">{{ row.path }}</td>
-            <td class="mono">{{ row.folder }}</td>
-            <td>v{{ row.winning_version }}</td>
-            <td>v{{ row.losing_version }}</td>
-            <td>
+      {% for row in rows %}
+        <article class="overwrite">
+          <header class="overwrite-head">
+            <p class="overwrite-path">{{ row.path }}</p>
+            <span class="overwrite-folder">{{ row.folder }}</span>
+          </header>
+          <div class="compare">
+            <div class="compare-col">
+              <span class="state">
+                <span class="dot dot-ok" aria-hidden="true"></span>Active version
+              </span>
+              <dl class="facts">
+                <dt>device</dt><dd>{{ row.winning.device }}</dd>
+                <dt>when</dt><dd>{{ row.winning.when }}</dd>
+                <dt>size</dt><dd>{{ row.winning.size }}</dd>
+                <dt>version</dt><dd>{{ row.winning.version_id }}</dd>
+              </dl>
+            </div>
+            <div class="compare-col">
+              <span class="state">
+                <span class="dot dot-idle" aria-hidden="true"></span>Superseded
+              </span>
+              <dl class="facts">
+                <dt>device</dt><dd>{{ row.losing.device }}</dd>
+                <dt>when</dt><dd>{{ row.losing.when }}</dd>
+                <dt>size</dt><dd>{{ row.losing.size }}</dd>
+                <dt>version</dt><dd>{{ row.losing.version_id }}</dd>
+              </dl>
               <form method="post" action="/overwrites/{{ row.id }}/resolve">
-                <button type="submit">restore older</button>
+                <button class="btn btn-primary" type="submit">Restore this version</button>
               </form>
-            </td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
+            </div>
+          </div>
+        </article>
+      {% endfor %}
     {% endif %}
   </main>
-</body>
-</html>
+</div>
+{% endblock %}

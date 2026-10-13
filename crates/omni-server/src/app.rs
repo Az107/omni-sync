@@ -24,7 +24,7 @@ use crate::chunkstore::ChunkError;
 use crate::state::AppState;
 use crate::templates::{
     Dashboard, DeviceView, Devices, Enroll, FolderView, Folders, Login, MemberView, OverwriteView,
-    Overwrites,
+    Overwrites, VersionView,
 };
 
 /// The dashboard session cookie name.
@@ -153,10 +153,17 @@ async fn static_asset(Path(path): Path<String>) -> Response {
                 Some("css") => "text/css",
                 Some("js") => "text/javascript",
                 Some("svg") => "image/svg+xml",
+                Some("woff2") => "font/woff2",
+                Some("txt") => "text/plain; charset=utf-8",
                 _ => "application/octet-stream",
             };
             (
-                [(header::CONTENT_TYPE, content_type)],
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    // Assets are embedded in the binary and only change on a
+                    // release, so a short shared cache is safe.
+                    (header::CACHE_CONTROL, "public, max-age=3600"),
+                ],
                 file.data.into_owned(),
             )
                 .into_response()
@@ -172,18 +179,44 @@ async fn dashboard(
     if !session_ok(&state, &headers) {
         return Ok(Redirect::to("/login").into_response());
     }
-    let devices = state.store.blocking(devices::count).await?;
-    let folders = state.store.blocking(folders::count).await?;
+    let folders = folder_views(&state).await?;
+    let devices = device_views(&state).await?;
     let overwrites = state
         .store
         .blocking(|conn| sync::overwrites(conn, true))
         .await?
         .len() as i64;
+
+    let behind: i64 = folders
+        .iter()
+        .map(|folder| {
+            folder
+                .members
+                .iter()
+                .filter(|member| member.lag > 0)
+                .count() as i64
+        })
+        .sum();
+    let online = devices
+        .iter()
+        .filter(|device| device.state_kind != "bad")
+        .count() as i64;
+    let (banner_kind, banner_head, banner_sub) = status_summary(
+        overwrites,
+        behind,
+        online,
+        folders.len() as i64,
+        devices.len() as i64,
+    );
+
     let page = Dashboard {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        devices,
+        active: "overview".to_string(),
+        banner_kind,
+        banner_head,
+        banner_sub,
         folders,
-        overwrites,
+        devices,
     };
     Ok(Html(page.render()?).into_response())
 }
@@ -202,18 +235,11 @@ async fn devices_page(
     if !session_ok(&state, &headers) {
         return Ok(Redirect::to("/login").into_response());
     }
-    let devices = state.store.blocking(devices::list).await?;
+    let devices = device_views(&state).await?;
     let page = Devices {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        devices: devices
-            .into_iter()
-            .map(|device| DeviceView {
-                name: device.name,
-                id: device.id,
-                last_seen: device.last_seen_at.unwrap_or_else(|| "never".to_string()),
-                revoked: device.revoked,
-            })
-            .collect(),
+        active: "devices".to_string(),
+        devices,
         code: query.code,
     };
     Ok(Html(page.render()?).into_response())
@@ -242,38 +268,11 @@ async fn folders_page(
     if !session_ok(&state, &headers) {
         return Ok(Redirect::to("/login").into_response());
     }
-    let folders = state.store.blocking(folders::list).await?;
-    let mut views = Vec::with_capacity(folders.len());
-    for folder in folders {
-        let id = folder.id.clone();
-        let head = state
-            .store
-            .blocking(move |conn| sync::folder_head(conn, &id))
-            .await?;
-        let lookup = folder.id.clone();
-        let members = state
-            .store
-            .blocking(move |conn| members::list(conn, &lookup))
-            .await?;
-        views.push(FolderView {
-            id: folder.id,
-            name: folder.name,
-            head_seq: head,
-            members: members
-                .into_iter()
-                .map(|member| MemberView {
-                    device_name: member.device_name,
-                    root: display_path(&member.root_path),
-                    mode: member.mode,
-                    acked_seq: member.acked_seq,
-                    lag: (head - member.acked_seq).max(0),
-                })
-                .collect(),
-        });
-    }
+    let folders = folder_views(&state).await?;
     let page = Folders {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        folders: views,
+        active: "folders".to_string(),
+        folders,
     };
     Ok(Html(page.render()?).into_response())
 }
@@ -317,7 +316,7 @@ async fn overwrites_page(
     }
     let rows = state
         .store
-        .blocking(|conn| sync::overwrites(conn, true))
+        .blocking(|conn| sync::overwrites_detailed(conn, true))
         .await?;
     let folders = state.store.blocking(folders::list).await?;
     let names: std::collections::HashMap<String, String> = folders
@@ -327,6 +326,7 @@ async fn overwrites_page(
 
     let page = Overwrites {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        active: "overwrites".to_string(),
         rows: rows
             .into_iter()
             .map(|row| OverwriteView {
@@ -336,8 +336,18 @@ async fn overwrites_page(
                     .cloned()
                     .unwrap_or_else(|| row.folder_id.clone()),
                 path: display_path(&row.path),
-                losing_version: row.losing_version_id,
-                winning_version: row.winning_version_id,
+                losing: VersionView {
+                    version_id: row.losing_version_id,
+                    device: row.losing_device,
+                    when: human_age(row.losing_age_secs),
+                    size: human_size(row.losing_size),
+                },
+                winning: VersionView {
+                    version_id: row.winning_version_id,
+                    device: row.winning_device,
+                    when: human_age(row.winning_age_secs),
+                    size: human_size(row.winning_size),
+                },
             })
             .collect(),
     };
@@ -498,7 +508,7 @@ async fn enroll_page(Query(query): Query<EnrollQuery>) -> Result<Response, AppEr
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
+            "default-src 'none'; style-src 'self'; font-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'",
         ),
     );
     Ok(response)
@@ -749,12 +759,25 @@ async fn list_ops(
     Path(folder_id): Path<String>,
     Query(query): Query<SinceQuery>,
 ) -> Result<Json<OpsResponse>, AppError> {
-    let _device = authenticate(&state, &headers).await?;
+    let device = authenticate(&state, &headers).await?;
     let since = query.since;
+    let lookup = folder_id.clone();
     let entries = state
         .store
-        .blocking(move |conn| sync::log_since(conn, &folder_id, since))
+        .blocking(move |conn| sync::log_since(conn, &lookup, since))
         .await?;
+
+    // A pull also tells us how far this device has caught up: it will apply
+    // everything returned, so its watermark becomes the last seq (or its
+    // `since` when nothing is new). This is what the dashboard's rail shows.
+    let acked = entries.last().map(|entry| entry.seq).unwrap_or(since);
+    let folder = folder_id.clone();
+    let device_id = device.id.clone();
+    state
+        .store
+        .blocking(move |conn| members::set_acked(conn, &folder, &device_id, acked))
+        .await?;
+
     Ok(Json(OpsResponse {
         entries: entries.into_iter().map(log_dto).collect(),
     }))
@@ -915,6 +938,175 @@ fn overwrite_dto(row: OverwriteRow) -> OverwriteDto {
 
 // ---- helpers ---------------------------------------------------------------
 
+/// Every folder with its members, each carrying the data the sync rail needs.
+async fn folder_views(state: &AppState) -> Result<Vec<FolderView>, AppError> {
+    let folders = state.store.blocking(folders::list).await?;
+    let mut views = Vec::with_capacity(folders.len());
+    for folder in folders {
+        let id = folder.id.clone();
+        let head = state
+            .store
+            .blocking(move |conn| sync::folder_head(conn, &id))
+            .await?;
+        let lookup = folder.id.clone();
+        let members = state
+            .store
+            .blocking(move |conn| members::list(conn, &lookup))
+            .await?;
+
+        let member_views: Vec<MemberView> = members
+            .into_iter()
+            .map(|member| member_view(member, head))
+            .collect();
+        let behind = member_views.iter().filter(|member| member.lag > 0).count();
+        let (state_kind, state_label) = if member_views.is_empty() {
+            ("idle", "no devices".to_string())
+        } else if behind == 0 {
+            ("ok", "up to date".to_string())
+        } else {
+            ("warn", format!("{behind} of {} behind", member_views.len()))
+        };
+
+        views.push(FolderView {
+            id: folder.id,
+            name: folder.name,
+            state_kind: state_kind.to_string(),
+            state_label,
+            members: member_views,
+        });
+    }
+    Ok(views)
+}
+
+/// Turn a member's acked watermark into a rail position and a label. With no
+/// ops in the folder there is nothing to be behind of, so the rail reads full.
+fn member_view(member: members::Member, head: i64) -> MemberView {
+    let lag = (head - member.acked_seq).max(0);
+    let pct = if head <= 0 || lag == 0 {
+        100
+    } else {
+        (member.acked_seq.max(0) * 100 / head).clamp(0, 100)
+    };
+    let (lag_label, state_label) = if lag == 0 {
+        ("in sync".to_string(), "in sync".to_string())
+    } else {
+        (format!("{lag} behind"), format!("{lag} ops behind"))
+    };
+    MemberView {
+        device_name: member.device_name,
+        root: display_path(&member.root_path),
+        lag,
+        pct,
+        lag_label,
+        state_label,
+    }
+}
+
+/// Every device with its presence state and a human age of the last contact.
+async fn device_views(state: &AppState) -> Result<Vec<DeviceView>, AppError> {
+    let devices = state.store.blocking(devices::list_with_seen).await?;
+    Ok(devices
+        .into_iter()
+        .map(|device| {
+            let (state_kind, state_label) = if device.revoked {
+                ("bad", "revoked".to_string())
+            } else if device.seen_seconds.is_none() {
+                ("warn", "never seen".to_string())
+            } else {
+                ("ok", "active".to_string())
+            };
+            DeviceView {
+                name: device.name,
+                id: device.id,
+                state_kind: state_kind.to_string(),
+                state_label,
+                seen: device.seen_seconds.map(human_age).unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
+/// The single sentence the overview leads with. Pure, so it is unit-tested.
+fn status_summary(
+    overwrites: i64,
+    behind: i64,
+    online: i64,
+    folders: i64,
+    devices_total: i64,
+) -> (String, String, String) {
+    if overwrites > 0 {
+        (
+            "bad".to_string(),
+            format!("{} to review", count(overwrites, "overwrite")),
+            "Two devices changed the same file while apart. Keep one; the other stays stored."
+                .to_string(),
+        )
+    } else if behind > 0 {
+        (
+            "warn".to_string(),
+            format!("{} behind", count(behind, "device")),
+            "A device is behind on a folder's change log. It catches up on the next poll."
+                .to_string(),
+        )
+    } else if devices_total == 0 {
+        (
+            "idle".to_string(),
+            "Nothing is syncing yet".to_string(),
+            "Add a device, then run `omni-sync add` to choose a folder.".to_string(),
+        )
+    } else {
+        (
+            "ok".to_string(),
+            "All clear".to_string(),
+            format!(
+                "{}, {}, nothing to review",
+                count(online, "device"),
+                count(folders, "folder")
+            ),
+        )
+    }
+}
+
+fn count(n: i64, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
+/// A compact age, e.g. `just now`, `4 min ago`, `yesterday`, `3 weeks ago`.
+fn human_age(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    match seconds {
+        s if s < 45 => "just now".to_string(),
+        s if s < 90 => "1 min ago".to_string(),
+        s if s < 3_600 => format!("{} min ago", s / 60),
+        s if s < 5_400 => "1 hour ago".to_string(),
+        s if s < 86_400 => format!("{} hours ago", s / 3_600),
+        s if s < 172_800 => "yesterday".to_string(),
+        s if s < 1_209_600 => format!("{} days ago", s / 86_400),
+        s if s < 2_592_000 => format!("{} weeks ago", s / 604_800),
+        s => format!("{} months ago", s / 2_592_000),
+    }
+}
+
+/// Bytes at a human scale, e.g. `812 B`, `14.2 KiB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Render raw path bytes for display. Lossy on purpose: this is a web page, not
 /// the sync path, and a replacement character is honest about undecodable names.
 fn display_path(path: &[u8]) -> String {
@@ -1014,5 +1206,72 @@ mod tests {
         assert_eq!(percent_encode("ABCD-EFGHJ"), "ABCD-EFGHJ");
         assert_eq!(percent_encode("a b&c"), "a%20b%26c");
         assert_eq!(percent_encode("\r\n"), "%0D%0A");
+    }
+
+    #[test]
+    fn ages_are_human_and_monotonic() {
+        assert_eq!(human_age(3), "just now");
+        assert_eq!(human_age(60), "1 min ago");
+        assert_eq!(human_age(600), "10 min ago");
+        assert_eq!(human_age(7_200), "2 hours ago");
+        assert_eq!(human_age(100_000), "yesterday");
+        assert_eq!(human_age(3 * 86_400), "3 days ago");
+        assert_eq!(human_age(14 * 86_400), "2 weeks ago");
+        // A clock skew that puts a device "in the future" is clamped, not negative.
+        assert_eq!(human_age(-5), "just now");
+    }
+
+    #[test]
+    fn sizes_use_binary_units() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(812), "812 B");
+        assert_eq!(human_size(1024), "1.0 KiB");
+        assert_eq!(human_size(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    #[test]
+    fn the_overview_leads_with_the_most_urgent_state() {
+        // Overwrites outrank lag.
+        let (kind, head, _) = status_summary(1, 3, 2, 1, 2);
+        assert_eq!(kind, "bad");
+        assert_eq!(head, "1 overwrite to review");
+        // Lag next.
+        let (kind, head, _) = status_summary(0, 2, 2, 1, 2);
+        assert_eq!(kind, "warn");
+        assert_eq!(head, "2 devices behind");
+        // Nothing enrolled.
+        let (kind, _, _) = status_summary(0, 0, 0, 0, 0);
+        assert_eq!(kind, "idle");
+        // Otherwise all clear, with counts that read naturally at 1 and n.
+        let (kind, head, sub) = status_summary(0, 0, 2, 1, 2);
+        assert_eq!(kind, "ok");
+        assert_eq!(head, "All clear");
+        assert_eq!(sub, "2 devices, 1 folder, nothing to review");
+    }
+
+    #[test]
+    fn a_member_with_no_log_ahead_reads_in_sync() {
+        let member = |acked_seq: i64| members::Member {
+            device_id: "d1".into(),
+            device_name: "laptop".into(),
+            root_path: b"/docs".to_vec(),
+            mode: "both".into(),
+            acked_seq,
+        };
+        // Empty folder: nothing to be behind of.
+        let view = member_view(member(0), 0);
+        assert_eq!(view.pct, 100);
+        assert_eq!(view.lag_label, "in sync");
+
+        // Four of ten ops acked: the rail is 40% full and the gap is named.
+        let view = member_view(member(4), 10);
+        assert_eq!(view.pct, 40);
+        assert_eq!(view.lag, 6);
+        assert_eq!(view.lag_label, "6 behind");
+
+        // Caught up.
+        let view = member_view(member(10), 10);
+        assert_eq!(view.pct, 100);
+        assert_eq!(view.lag, 0);
     }
 }

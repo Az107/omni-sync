@@ -77,6 +77,23 @@ pub struct OverwriteRow {
     pub resolved: bool,
 }
 
+/// An overwrite with the metadata of both versions, for the dashboard's review
+/// decision (which device made each version, when, and how big it is).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverwriteDetail {
+    pub id: i64,
+    pub folder_id: String,
+    pub path: PathBytes,
+    pub losing_version_id: i64,
+    pub winning_version_id: i64,
+    pub losing_device: String,
+    pub losing_size: u64,
+    pub losing_age_secs: i64,
+    pub winning_device: String,
+    pub winning_size: u64,
+    pub winning_age_secs: i64,
+}
+
 fn kind_str(kind: OpKind) -> &'static str {
     match kind {
         OpKind::Put => "put",
@@ -418,6 +435,54 @@ pub fn overwrites(conn: &Connection, open_only: bool) -> Result<Vec<OverwriteRow
 
 fn decode_chunks(json: &str) -> Result<Vec<ChunkRef>, StoreError> {
     serde_json::from_str(json).map_err(|e| StoreError::Json(e.to_string()))
+}
+
+/// The review queue with each version's device, size and age, newest first.
+/// Ages are computed in SQLite so the dashboard needs no date parsing.
+pub fn overwrites_detailed(
+    conn: &Connection,
+    open_only: bool,
+) -> Result<Vec<OverwriteDetail>, StoreError> {
+    let filter = if open_only {
+        "WHERE o.resolved_at IS NULL"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT o.id, o.folder_id, o.path, o.losing_version_id, o.winning_version_id,
+                COALESCE(dl.name, lv.device_id), lv.size,
+                CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', lv.created_at) AS INTEGER),
+                COALESCE(dw.name, wv.device_id), wv.size,
+                CAST(strftime('%s', 'now') AS INTEGER) - CAST(strftime('%s', wv.created_at) AS INTEGER)
+           FROM overwrites o
+           JOIN versions lv ON lv.id = o.losing_version_id
+           JOIN versions wv ON wv.id = o.winning_version_id
+           LEFT JOIN devices dl ON dl.id = lv.device_id
+           LEFT JOIN devices dw ON dw.id = wv.device_id
+           {filter}
+          ORDER BY o.id DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        Ok(OverwriteDetail {
+            id: row.get(0)?,
+            folder_id: row.get(1)?,
+            path: row.get(2)?,
+            losing_version_id: row.get(3)?,
+            winning_version_id: row.get(4)?,
+            losing_device: row.get(5)?,
+            losing_size: row.get::<_, i64>(6)? as u64,
+            losing_age_secs: row.get(7)?,
+            winning_device: row.get(8)?,
+            winning_size: row.get::<_, i64>(9)? as u64,
+            winning_age_secs: row.get(10)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -1,0 +1,21 @@
+<header class="rail">
+  <a class="brand" href="/">
+    <svg class="mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" focusable="false">
+      <rect x="1" y="1" width="7" height="7" rx="1.5"/>
+      <rect x="10" y="1" width="7" height="7" rx="1.5"/>
+      <rect x="1" y="10" width="7" height="7" rx="1.5"/>
+      <rect class="mark-accent" x="10" y="10" width="7" height="7" rx="1.5"/>
+    </svg>
+    omni-sync
+  </a>
+  <nav class="nav" aria-label="Sections">
+    <a href="/" {% if active == "overview" %}aria-current="page"{% endif %}>Overview</a>
+    <a href="/devices" {% if active == "devices" %}aria-current="page"{% endif %}>Devices</a>
+    <a href="/folders" {% if active == "folders" %}aria-current="page"{% endif %}>Folders</a>
+    <a href="/overwrites" {% if active == "overwrites" %}aria-current="page"{% endif %}>Overwrites</a>
+  </nav>
+  <div class="rail-foot">
+    <span class="server">server {{ version }}</span>
+    <form method="post" action="/logout"><button class="btn btn-ghost" type="submit">Log out</button></form>
+  </div>
+</header>

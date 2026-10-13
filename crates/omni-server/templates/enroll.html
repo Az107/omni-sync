@@ -1,67 +1,66 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync · enroll a device</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header class="bar">
-    <span class="brand">omni-sync</span>
-    <nav></nav>
-  </header>
+{% extends "base.html" %}
+{% block title %}Enroll a device · omni-sync{% endblock %}
+{% block body %}
+<header class="topbar">
+  <a class="brand" href="/">
+    <svg class="mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" focusable="false">
+      <rect x="1" y="1" width="7" height="7" rx="1.5"/>
+      <rect x="10" y="1" width="7" height="7" rx="1.5"/>
+      <rect x="1" y="10" width="7" height="7" rx="1.5"/>
+      <rect class="mark-accent" x="10" y="10" width="7" height="7" rx="1.5"/>
+    </svg>
+    omni-sync
+  </a>
+</header>
 
-  <main>
-    <h1>Enroll a device</h1>
-    <p class="muted">server {{ version }}</p>
+<main class="doc" id="content">
+  <div class="page-head">
+    <div>
+      <h1 class="page-title">Enroll a device</h1>
+      <p class="page-note">Install the client, enroll this computer, then choose a folder to keep in sync.</p>
+    </div>
+  </div>
 
     {% if let Some(code) = code %}
-      <p class="notice">
-        Pairing code <strong>{{ code }}</strong> — valid for 10 minutes and
-        usable once.
-      </p>
+      <section class="notice" aria-label="Pairing code">
+        <p class="notice-head">Pairing code {{ code }}</p>
+        <p>Valid for 10 minutes and usable once. It is already in this page's address, so the command below needs nothing else.</p>
+      </section>
     {% else %}
-      <p class="error">
-        This link has no pairing code. Open <em>devices → add a device</em>
-        on the dashboard to mint one.
-      </p>
+      <section class="banner banner-bad" aria-label="No pairing code">
+        <span class="dot dot-bad" aria-hidden="true"></span>
+        <div>
+          <p class="banner-head">This link has no code</p>
+          <p class="banner-sub">Open Devices, choose “Add a device”, and use the link it gives you.</p>
+        </div>
+      </section>
     {% endif %}
 
-    <section>
-      <h2>1. Install the client</h2>
-      <p>Download the build for this computer and put it on your <code>PATH</code>:</p>
-      <p>
-        <a href="{{ releases_url }}">latest releases</a>
-      </p>
-      <p class="muted">
-        Linux x86_64, macOS (Apple silicon and Intel) and Windows (x64 and
-        arm64) are published as <code>omni-sync-&lt;version&gt;-&lt;target&gt;</code>.
-      </p>
-    </section>
+    <div class="steps">
+      <section class="step">
+        <h2><span class="step-num" aria-hidden="true">1</span>Install the client</h2>
+        <p><a href="{{ releases_url }}">Download the latest release</a> and put <code>omni-sync</code> on your PATH.</p>
+        <p class="muted">Linux (x86_64, arm64), macOS (Apple silicon, Intel) and Windows (x64, arm64) are published as <code>omni-sync-&lt;version&gt;-&lt;target&gt;</code>.</p>
+      </section>
 
-    <section>
-      <h2>2. Enroll this computer</h2>
-      {% if code.is_some() %}
-        <p>
-          Copy this page's address from the browser bar and run:
-        </p>
-        <pre class="cmd">omni-sync enroll --link '&lt;paste this page's URL&gt;'</pre>
-        <p>Or enroll by hand, supplying the server URL and the code:</p>
-        <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code &lt;code above&gt;</pre>
-      {% else %}
-        <p>Once you have a link with a code, run:</p>
-        <pre class="cmd">omni-sync enroll --link '&lt;the link from the dashboard&gt;'</pre>
-      {% endif %}
-    </section>
+      <section class="step">
+        <h2><span class="step-num" aria-hidden="true">2</span>Enroll this computer</h2>
+        {% if code.is_some() %}
+          <p>Copy this page's address from the browser bar, then run:</p>
+          <pre class="cmd">omni-sync enroll --link '&lt;this page's URL&gt;'</pre>
+          <p>Or by hand, using the server URL and the code above:</p>
+          <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code &lt;code above&gt;</pre>
+        {% else %}
+          <p>Once you have a link with a code, run:</p>
+          <pre class="cmd">omni-sync enroll --link '&lt;the link from the dashboard&gt;'</pre>
+        {% endif %}
+      </section>
 
-    <section>
-      <h2>3. Watch a folder</h2>
-      <pre class="cmd">omni-sync add</pre>
-      <p class="muted">
-        The wizard lists the server's shared folders and asks for a local path.
-      </p>
-    </section>
+      <section class="step">
+        <h2><span class="step-num" aria-hidden="true">3</span>Watch a folder</h2>
+        <pre class="cmd">omni-sync add</pre>
+        <p class="muted">The wizard lists the server's folders and asks for a local path.</p>
+      </section>
+    </div>
   </main>
-</body>
-</html>
+{% endblock %}

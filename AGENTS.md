@@ -170,6 +170,19 @@ twice returns `400 invalid, expired or already-used pairing code`.
 - **askama's `render()` is a trait method.** `use askama::Template as _;`
   must be in scope where you call it, not only where the struct is
   defined.
+- **The dashboard is one stylesheet plus small templates.** `static/app.css`
+  holds the design tokens (`:root` + `prefers-color-scheme`), two bundled
+  fonts (Archivo for language, IBM Plex Mono for machine data; SIL OFL, in
+  `static/fonts/`), and every component. Pages extend `templates/base.html`
+  and share `_rail.html` (navigation) and `_folder.html` (a folder with its
+  sync rail). Monospace is reserved for ids, paths, hashes and commands.
+  `static_asset` serves `font/woff2` with a one-hour cache.
+- **The sync rail is the dashboard's signature.** It draws `members.acked_seq`
+  against the folder's op-log head, so "behind" is literal. The server records
+  a member's watermark on every pull (`GET /folders/{id}/ops` →
+  `members::set_acked`); without that the rail would always read behind. The
+  overview leads with a status banner (`status_summary`, unit-tested) rather
+  than a row of metric cards.
 - **axum 0.8 catch-all routes are `{*path}`**, not `/*path`.
 - **`omni-update` derives the target triple from `build.rs`** (which
   re-emits the build script's `TARGET` as `OMNI_TARGET`). Asset selection

@@ -1,64 +1,58 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync · devices</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header class="bar">
-    <span class="brand">omni-sync</span>
-    <nav>
-      <a href="/">overview</a>
-      <a href="/devices">devices</a>
-      <a href="/folders">folders</a>
-      <a href="/overwrites">overwrites</a>
-    </nav>
-    <form method="post" action="/logout"><button type="submit">log out</button></form>
-  </header>
-
-  <main>
-    <h1>Devices</h1>
-
-    <form method="post" action="/devices/pair">
-      <button type="submit">Add a device</button>
-    </form>
+{% extends "base.html" %}
+{% block title %}Devices · omni-sync{% endblock %}
+{% block body %}
+<div class="shell">
+  {% include "_rail.html" %}
+  <main class="main" id="content">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">Devices</h1>
+        <p class="page-note">Every device holds a token and syncs the folders it declares. Add one with a pairing link.</p>
+      </div>
+      <form method="post" action="/devices/pair">
+        <button class="btn btn-primary" type="submit">Add a device</button>
+      </form>
+    </div>
 
     {% if let Some(code) = code %}
-      <p class="notice">
-        Pairing code <strong>{{ code }}</strong> — valid 10 minutes, usable once.<br>
-        Magic link (open it on the new machine):
-        <a id="magic-link" href="enroll?code={{ code }}">enroll</a>
-        <br><code id="magic-url" class="mono"></code>
-      </p>
-      <p class="muted">
-        Or by hand:
-        <code>omni-sync enroll --server &lt;url&gt; --code {{ code }}</code>
-      </p>
-      <script>
-        (function () {
-          var base = location.origin + location.pathname.replace(/devices\/?$/, "");
-          var url = base + "enroll?code={{ code }}";
-          document.getElementById("magic-link").href = url;
-          document.getElementById("magic-url").textContent = url;
-        })();
-      </script>
+      <section class="notice" aria-label="New pairing link">
+        <p class="notice-head">Pairing link ready</p>
+        <p>Open this address on the new machine, or copy it into <code>omni-sync enroll --link</code>. Valid for 10 minutes, usable once.</p>
+        <pre class="cmd" id="magic-url"></pre>
+        <p class="page-note">By hand: <code>omni-sync enroll --server &lt;server-url&gt; --code {{ code }}</code></p>
+        <script>
+          (function () {
+            var base = location.origin + location.pathname.replace(/devices\/?$/, "");
+            var url = base + "enroll?code={{ code }}";
+            document.getElementById("magic-url").textContent = url;
+          })();
+        </script>
+      </section>
     {% endif %}
 
-    <table>
-      <thead><tr><th>name</th><th>id</th><th>last seen</th><th>state</th></tr></thead>
-      <tbody>
-      {% for device in devices %}
-        <tr>
-          <td>{{ device.name }}</td>
-          <td class="mono">{{ device.id }}</td>
-          <td>{{ device.last_seen }}</td>
-          <td>{% if device.revoked %}revoked{% else %}active{% endif %}</td>
-        </tr>
-      {% endfor %}
-      </tbody>
-    </table>
+    <section class="section">
+      {% if devices.is_empty() %}
+        <div class="empty">
+          <strong>No devices yet</strong>
+          Choose “Add a device” to mint a pairing link, then run the command it shows on the new machine.
+        </div>
+      {% else %}
+        <ul class="rows">
+          {% for device in devices %}
+            <li class="row">
+              <div class="row-main">
+                <span class="row-title">{{ device.name }}</span>
+                <span class="row-sub">{{ device.id }}</span>
+              </div>
+              {% if !device.seen.is_empty() %}<span class="row-meta">seen {{ device.seen }}</span>{% endif %}
+              <span class="state">
+                <span class="dot dot-{{ device.state_kind }}" aria-hidden="true"></span>{{ device.state_label }}
+              </span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    </section>
   </main>
-</body>
-</html>
+</div>
+{% endblock %}

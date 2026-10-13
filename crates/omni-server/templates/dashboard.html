@@ -1,32 +1,53 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header class="bar">
-    <span class="brand">omni-sync</span>
-    <nav>
-      <a href="/">overview</a>
-      <a href="/devices">devices</a>
-      <a href="/folders">folders</a>
-      <a href="/overwrites">overwrites</a>
-    </nav>
-    <form method="post" action="/logout"><button type="submit">log out</button></form>
-  </header>
-
-  <main>
-    <h1>Overview</h1>
-    <p class="muted">server {{ version }}</p>
-
-    <div class="cards">
-      <section class="card"><h2>{{ devices }}</h2><p>devices enrolled</p></section>
-      <section class="card"><h2>{{ folders }}</h2><p>shared folders</p></section>
-      <section class="card"><h2>{{ overwrites }}</h2><p>open overwrites</p></section>
+{% extends "base.html" %}
+{% block title %}Overview · omni-sync{% endblock %}
+{% block body %}
+<div class="shell">
+  {% include "_rail.html" %}
+  <main class="main" id="content">
+    <div class="page-head">
+      <h1 class="page-title">Overview</h1>
     </div>
+
+    <section class="banner banner-{{ banner_kind }}" aria-label="Sync status">
+      <span class="dot dot-{{ banner_kind }}" aria-hidden="true"></span>
+      <div>
+        <p class="banner-head">{{ banner_head }}</p>
+        <p class="banner-sub">{{ banner_sub }}</p>
+      </div>
+    </section>
+
+    {% if !folders.is_empty() %}
+      {% let compact = true %}
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">Folders</h2>
+          <a href="/folders">Manage</a>
+        </div>
+        {% for folder in folders %}{% include "_folder.html" %}{% endfor %}
+      </section>
+    {% endif %}
+
+    {% if !devices.is_empty() %}
+      <section class="section">
+        <div class="section-head">
+          <h2 class="section-title">Devices</h2>
+          <a href="/devices">Manage</a>
+        </div>
+        <ul class="rows">
+          {% for device in devices %}
+            <li class="row">
+              <div class="row-main">
+                <span class="row-title">{{ device.name }}</span>
+              </div>
+              {% if !device.seen.is_empty() %}<span class="row-meta">seen {{ device.seen }}</span>{% endif %}
+              <span class="state">
+                <span class="dot dot-{{ device.state_kind }}" aria-hidden="true"></span>{{ device.state_label }}
+              </span>
+            </li>
+          {% endfor %}
+        </ul>
+      </section>
+    {% endif %}
   </main>
-</body>
-</html>
+</div>
+{% endblock %}

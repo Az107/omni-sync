@@ -404,6 +404,13 @@ versions: diff for text, magic-byte preview for images, metadata card and
     Releases publish bare binaries alongside the archives. The server
     container runs `docker-entrypoint.sh`, which prefers a binary staged
     on the `/state` volume by `update --download-only /state/bin`.
+  - **Dashboard redesign.** One stylesheet, two bundled OFL fonts
+    (Archivo + IBM Plex Mono), a petrol accent, and a left rail that
+    collapses to a top bar on phones. The overview leads with a status
+    banner instead of metric cards, and each folder shows a **sync rail**
+    — `members.acked_seq` drawn against the op-log head — so "behind" is
+    literal rather than a count. The overwrite queue compares the active
+    and superseded versions side by side (device, time, size).
 - **Later**: direct client↔client transfer, per-folder convergent
   encryption, bandwidth caps, more OSes, signed releases.
 

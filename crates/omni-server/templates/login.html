@@ -1,22 +1,27 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>omni-sync · log in</title>
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body class="centered">
-  <form class="login" method="post" action="/login">
-    <h1>omni-sync</h1>
-    <p class="muted">server {{ version }}</p>
+{% extends "base.html" %}
+{% block title %}Log in · omni-sync{% endblock %}
+{% block body %}
+<div class="gate">
+  <form class="gate-card" method="post" action="/login">
+    <a class="brand" href="/">
+      <svg class="mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="7" height="7" rx="1.5"/>
+        <rect x="10" y="1" width="7" height="7" rx="1.5"/>
+        <rect x="1" y="10" width="7" height="7" rx="1.5"/>
+        <rect class="mark-accent" x="10" y="10" width="7" height="7" rx="1.5"/>
+      </svg>
+      omni-sync
+    </a>
+    <p class="page-note">Sign in to manage devices, folders and overwrites. Server {{ version }}.</p>
     {% if let Some(message) = error %}
       <p class="error">{{ message }}</p>
     {% endif %}
-    <label for="password">dashboard password</label>
-    <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+    <div class="gate-form">
+      <label for="password">Dashboard password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" autofocus>
+    </div>
     <input type="hidden" name="next" value="{{ next }}">
-    <button type="submit">log in</button>
+    <button class="btn btn-primary" type="submit">Log in</button>
   </form>
-</body>
-</html>
+</div>
+{% endblock %}

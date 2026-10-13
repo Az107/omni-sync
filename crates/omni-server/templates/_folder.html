@@ -1,0 +1,30 @@
+<article class="folder">
+  <header class="folder-head">
+    <h3 class="folder-title">{{ folder.name }}</h3>
+    {% if !compact %}<span class="folder-id">{{ folder.id }}</span>{% endif %}
+    <span class="state folder-state">
+      <span class="dot dot-{{ folder.state_kind }}" aria-hidden="true"></span>{{ folder.state_label }}
+    </span>
+  </header>
+  {% if folder.members.is_empty() %}
+    <p class="folder-empty">
+      No device holds this folder yet — run <code>omni-sync add</code> on a device to watch it.
+    </p>
+  {% else %}
+    <ul class="members">
+      {% for member in folder.members %}
+        <li class="member">
+          <div class="member-who">
+            <span class="member-dev">{{ member.device_name }}</span>
+            <span class="member-root">{{ member.root }}</span>
+          </div>
+          <div class="track" role="img" aria-label="{{ member.state_label }}">
+            <span class="track-fill{% if member.lag > 0 %} is-behind{% endif %}"
+                  style="width: {{ member.pct }}%"></span>
+          </div>
+          <span class="member-lag">{{ member.lag_label }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+</article>
