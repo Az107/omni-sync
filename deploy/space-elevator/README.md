@@ -112,37 +112,64 @@ omni-sync daemon
 The client appends API paths *under* its base URL, so the `/app/omni-sync`
 prefix needs no special configuration.
 
-## Persistence — and the compose-hash footgun
+## Persistence — space-elevator does not carry volumes across updates
 
 - `omnidata` → `/data` (content-addressed chunk store)
 - `omnistate` → `/state` (SQLite: devices, folders, ops, versions, overwrites)
 
-**space-elevator names these volumes by a hash of the compose stack, not
-by the logical volume name.** Editing `compose.yml` — even to add a
-`restart:` policy or an environment variable — changes the hash, so the
-next `se apps update` points the app at *new, empty* volumes and the data
-looks gone.
+**Every `se apps update` mounts brand-new, empty volumes.** space-elevator
+v0.1.0 manages app volumes itself — it strips the compose's `volumes:`
+block and records the mapping in its `app_storage` table — but that table
+is **empty for every app on this host**, and there is no storage flag on
+`deploy`/`upload`/`update`. So each release gets fresh, randomly named
+volumes (e.g. `49999d76…` → `/state`), and the server comes up with an
+empty database and chunk store. The volume name is not derivable from the
+app, release, or logical name, and the compose content makes no
+difference, so this cannot be pinned from here.
 
-The update prints "persistent data was preserved" and writes a backup
-under `~services/.local/share/space-elevator/backups/<app-id>/<release>/`,
-but that manifest is metadata-only (`"storage": null`): it does **not**
-snapshot the volume. The old volumes are not deleted, so the data is still
-on disk and can be carried across:
+The update still prints "persistent data was preserved" and writes a
+backup under `~services/.local/share/space-elevator/backups/<app-id>/<release>/`,
+but that manifest is metadata-only (`"storage": null`): it does not
+snapshot the volume. The previous releases' volumes are **not deleted**,
+so the data is recoverable.
+
+To carry it across after a `se apps update`:
 
 ```sh
-# find the old volumes (64-hex names); the old pair predates this deploy
-sudo -n -u services -- podman volume ls -q
-# checkpoint the old DB so its WAL is folded in, then copy server.db and
-# chunks/ into the volumes the *new* container mounts (podman inspect),
-# with the container stopped, and start it again.
+sg service-admin -c 'se apps stop omni-sync'
+# The new container's volumes:
+sudo -n -u services -- env HOME=/home/services XDG_RUNTIME_DIR=/run/user/1004 \
+  podman inspect se-omni-sync-web \
+  --format '{{range .Mounts}}{{.Name}} -> {{.Destination}}{{"\n"}}{{end}}'
+# The previous release's volumes still hold the data:
+sudo -n -u services -- ls /home/services/.local/share/containers/storage/volumes/
+# Fold the old WAL into a single clean DB, then copy server.db and chunks/
+# into the new volumes (owned services:services, DB mode 0600), and:
+sg service-admin -c 'se apps start omni-sync'
 ```
 
-The safe rule: **treat `compose.yml` as frozen.** Change it as rarely as
-possible, and when you must, plan to move the volume contents by hand.
+### The update path that does not lose data
+
+For a **binary-only** update, do not use `se apps update`. Every dashboard
+template and font is embedded in the binary (rust-embed), so swapping the
+binary carries the UI too. Publish a release, then update inside the
+running container, which writes to the volume it already holds:
+
+```sh
+sudo -n -u services -- env HOME=/home/services XDG_RUNTIME_DIR=/run/user/1004 \
+  podman exec se-omni-sync-web \
+  omni-sync-server update --download-only /state/bin
+sg service-admin -c 'se apps restart omni-sync'
+```
+
+`docker-entrypoint.sh` runs `/state/bin/omni-sync-server` when present, and
+`stop`/`start`/`restart` reuse the same container and its volumes, so
+nothing is remapped. `se apps update` is only needed when the image or
+toolchain must change — and then carry the volumes across as above.
 
 Keep the logical volume names (`omnidata`, `omnistate`) and the service
-name (`web`) unchanged regardless: they are what the compose stack
-declares.
+name (`web`) unchanged: the compose still has to declare them for the
+first deploy.
 
 
 ## Status

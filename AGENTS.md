@@ -243,12 +243,14 @@ The server ships as a container with a space-elevator compose stack:
 compose file is what makes the platform use managed named volumes
 (`omnidata` → `/data`, `omnistate` → `/state`); a plain Dockerfile drop
 gets a synthetic compose with no persistence, which would lose the SQLite
-state and the chunk store on every redeploy. **The volumes are named by a
-hash of the compose stack, so editing `compose.yml` remaps the app to
-empty volumes on the next `se apps update`** (the "backup" is metadata-only
-and does not snapshot them). Treat `compose.yml` as frozen; when it must
-change, carry the old volume contents across by hand. See the deploy
-README.
+state and the chunk store on every redeploy. **space-elevator v0.1.0 mounts
+fresh, empty volumes on every `se apps update`** — it strips the compose's
+`volumes:` and never populates its own `app_storage` mapping, so the server
+comes up with an empty database; the "backup" is metadata-only. Prefer a
+binary-only update inside the running container (`omni-sync-server update
+--download-only /state/bin` then `se apps restart`, which reuses the
+container's volumes); if `se apps update` is unavoidable, carry the old
+volumes across by hand. See the deploy README.
 
 **Deployed and verified from the outside** at
 `https://elevator.albruiz.dev/app/omni-sync/` — health, login, pairing,
