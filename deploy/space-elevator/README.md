@@ -167,6 +167,14 @@ sg service-admin -c 'se apps restart omni-sync'
 nothing is remapped. `se apps update` is only needed when the image or
 toolchain must change — and then carry the volumes across as above.
 
+The runtime base is `debian:trixie-slim` on purpose: the CI-built release
+binary is linked against Ubuntu 24.04's glibc (2.39), which bookworm (2.36)
+cannot run, so an in-container update on bookworm would crash-loop with
+`GLIBC_2.38 not found`. The baked binary is built on bookworm and runs on
+trixie regardless. The same glibc floor applies to the **client** binaries:
+a Linux older than Ubuntu 24.04 / Debian 13 may refuse them, so build them
+on an older runner if that matters.
+
 Keep the logical volume names (`omnidata`, `omnistate`) and the service
 name (`web`) unchanged: the compose still has to declare them for the
 first deploy.

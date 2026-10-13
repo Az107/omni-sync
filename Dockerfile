@@ -15,7 +15,10 @@ COPY . .
 RUN cargo build --release --locked -p omni-server
 
 # ---- runtime ---------------------------------------------------------------
-FROM docker.io/library/debian:bookworm-slim
+# trixie, not bookworm: the in-container self-updater downloads a binary built
+# on Ubuntu 24.04 (glibc 2.39), and bookworm's glibc 2.36 cannot run it. The
+# baked binary is built on bookworm (glibc 2.36) and runs fine on trixie.
+FROM docker.io/library/debian:trixie-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
