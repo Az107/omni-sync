@@ -182,18 +182,26 @@ first deploy.
 
 ## Status
 
-**0.2.0 verified from the outside.**
+**0.3.0 verified from the outside.**
 
-- `GET /healthz` → `{"ok":true,"version":"0.2.0"}`
-- `GET /` → `303` to login; login renders the redesigned dashboard;
+- `GET /healthz` → `{"ok":true,"version":"0.3.0"}`
+- `GET /` → `303` to login; login renders the designed dashboard;
   `/devices` mints a pairing code; `/static/app.css` → `200`;
   `/static/fonts/archivo-latin.woff2` → `200 font/woff2`.
-- A real client enrolled against the public URL, joined a folder, and
-  pushed a file; `GET /api/v1/folders/{id}/manifest` over the public URL
-  showed it with the expected size and content hash.
-- `omni-sync-server update --check` inside the running container reports
-  the release as current, so the in-container update path works on the
-  trixie base.
+- `GET /api/v1/folders/{id}/ops/stream` → `401` without a device token,
+  which is how the op-log SSE endpoint confirms it is routed.
+- The 0.2.0 → 0.3.0 update was done in-container
+  (`omni-sync-server update --download-only /state/bin`, then
+  `se apps restart omni-sync`). PID 1 then ran `/state/bin/omni-sync-server`
+  and `healthz` reported 0.3.0. No migration ran, and devices, folders,
+  ops, versions and overwrites were all still present afterwards, so the
+  restart reused the container and its volumes as intended.
+
+**The release must publish the host's own architecture.** This host and the
+container are `aarch64` and the running binary reports
+`aarch64-unknown-linux-gnu`, so `update` downloads
+`omni-sync-server-<version>-aarch64-unknown-linux-gnu`. An x86_64-only
+server matrix would leave the in-container update with no asset to fetch.
 
 The port-80/root detail above was found the hard way: the 8787 non-root
 build reported `running` yet returned `502`, which is exactly the failure
