@@ -1,13 +1,14 @@
 //! The sync engine.
 //!
-//! Push and pull run on **separate cadences**, because they cost wildly
-//! different amounts:
+//! Push and pull are both **event-driven**, and neither spins on a timer:
 //!
-//! - **push** needs to walk and hash the tree, so it is *event-driven* — the
-//!   `notify` watcher fires it on a change, with a slow safety scan (30 s) to
-//!   catch anything the watcher missed (edits while the daemon was down).
-//! - **pull** is a single HTTP GET of the op log, so it runs on a short timer
-//!   (2 s) to keep remote-change latency low.
+//! - **push** needs to walk and hash the tree, so the `notify` watcher fires it
+//!   on a change, with a slow safety scan (30 s) to catch anything the watcher
+//!   missed (edits while the daemon was down).
+//! - **pull** is woken by the server's op-log stream, so a remote change lands
+//!   in round-trip time instead of on a polling interval. A slow fallback poll
+//!   (60 s) covers a server that has no stream, or a connection that died
+//!   without the socket noticing.
 //!
 //! The scan itself only reads files whose size/mtime/mode changed since the
 //! last sync; unchanged files reuse their known chunk list without a read.
@@ -22,10 +23,13 @@ use omni_netproto::{OpDto, OpKindDto, decode_chunks, decode_path};
 use omni_store::{Store, agent};
 use omni_transfer::Client;
 
+use tokio::sync::mpsc;
+
 use crate::{apply, scan};
 
-/// How often the cheap op-log pull runs.
-const PULL_INTERVAL: Duration = Duration::from_secs(2);
+/// The safety net under the op stream: if the server has no event stream, or a
+/// connection dies without the socket noticing, this still pulls eventually.
+const FALLBACK_PULL_INTERVAL: Duration = Duration::from_secs(60);
 /// The slow full-tree safety scan, for changes the watcher did not see.
 const SAFETY_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 /// Quiet period after a filesystem event before scanning (coalesces save bursts).
@@ -69,10 +73,17 @@ impl Engine {
         let (_handle, mut events) = crate::watcher::watch(&self.config.root)
             .with_context(|| format!("watching {}", self.config.root.display()))?;
 
-        let mut pull = tokio::time::interval(PULL_INTERVAL);
+        // The stream is the fast path; the timer is the safety net.
+        let mut wake = spawn_op_waker(self.client.clone(), self.config.folder_id.clone());
+        let mut fallback = tokio::time::interval(FALLBACK_PULL_INTERVAL);
         let mut safety = tokio::time::interval(SAFETY_SCAN_INTERVAL);
-        pull.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        fallback.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         safety.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Catch up on whatever happened while we were down *before* pushing our
+        // own tree, so a first sync does not report a whole directory as an
+        // overwrite of content we had simply never seen.
+        self.logged("pull", self.pull()).await;
 
         loop {
             tokio::select! {
@@ -89,7 +100,10 @@ impl Engine {
                 _ = safety.tick() => {
                     self.logged("safety scan", self.push()).await;
                 }
-                _ = pull.tick() => {
+                Some(()) = wake.recv() => {
+                    self.logged("pull", self.pull()).await;
+                }
+                _ = fallback.tick() => {
                     self.logged("pull", self.pull()).await;
                 }
             }
@@ -191,6 +205,11 @@ impl Engine {
 
         let store = self.store.clone();
         let folder = self.config.folder_id.clone();
+        // Advance the watermark only over ops we really applied. The op ids are a
+        // single global sequence, so another device's op can land *inside* our
+        // batch; jumping the watermark to our last seq would skip it forever.
+        let applied: Vec<i64> = response.applied.iter().map(|entry| entry.seq).collect();
+        let watermark = advance_watermark(applied_seq, &applied);
         store
             .blocking_mut(move |conn| {
                 for (item, applied) in pending.iter().zip(response.applied.iter()) {
@@ -201,9 +220,7 @@ impl Engine {
                         None => agent::remove_file(conn, &folder, &item.path)?,
                     }
                 }
-                if let Some(last) = response.applied.last() {
-                    agent::set_applied_seq(conn, &folder, last.seq)?;
-                }
+                agent::set_applied_seq(conn, &folder, watermark)?;
                 Ok(())
             })
             .await?;
@@ -317,5 +334,100 @@ impl Engine {
             bytes.extend_from_slice(&data);
         }
         Ok(bytes)
+    }
+}
+
+/// Turn the server's op-log stream into wake-ups for the pull loop.
+///
+/// Running it as its own task keeps `run` a plain `select!`. It reconnects
+/// forever on a capped backoff: a server that has no stream endpoint just means
+/// the fallback timer drives the pull, and a dropped connection reconnects.
+fn spawn_op_waker(client: Client, folder_id: String) -> mpsc::Receiver<()> {
+    // Capacity 1: a burst of remote changes only ever means "there is work".
+    let (wake, rx) = mpsc::channel(1);
+    tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        let mut degraded = false;
+        loop {
+            match client.stream_ops(&folder_id).await {
+                Ok(mut stream) => {
+                    backoff = Duration::from_secs(1);
+                    if degraded {
+                        tracing::info!(folder = %folder_id, "op stream reconnected");
+                        degraded = false;
+                    }
+                    // Ends on a closed stream or a read error; either way we
+                    // fall through, back off, and connect again.
+                    while let Ok(Some(_)) = stream.next_head().await {
+                        let _ = wake.try_send(());
+                    }
+                }
+                Err(error) => {
+                    if !degraded {
+                        tracing::warn!(
+                            folder = %folder_id,
+                            %error,
+                            "op stream unavailable; relying on the fallback poll"
+                        );
+                        degraded = true;
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+    });
+    rx
+}
+
+/// The pull watermark to store after a push.
+///
+/// `applied` are the op ids the server assigned to this device's batch, in
+/// order. Op ids are one global sequence, so a *foreign* op can be interleaved
+/// into our batch — we take 101, another device takes 102, we take 103. The
+/// watermark may only move across ops this device has actually applied, so it
+/// advances along the longest contiguous run starting at `previous` and stops
+/// at the first gap. The next pull then re-fetches from the gap and delivers
+/// the foreign op; our own ops after it are applied twice, which is idempotent.
+fn advance_watermark(previous: i64, applied: &[i64]) -> i64 {
+    let mut watermark = previous;
+    for seq in applied {
+        if *seq == watermark + 1 {
+            watermark = *seq;
+        } else {
+            break;
+        }
+    }
+    watermark
+}
+
+#[cfg(test)]
+mod tests {
+    use super::advance_watermark;
+
+    #[test]
+    fn a_contiguous_batch_moves_the_watermark_to_its_end() {
+        assert_eq!(advance_watermark(0, &[1, 2, 3]), 3);
+        assert_eq!(advance_watermark(7, &[8, 9]), 9);
+    }
+
+    #[test]
+    fn a_foreign_op_inside_the_batch_stops_the_watermark_at_the_gap() {
+        // We pushed 101 and 103; another device took 102 in between.
+        assert_eq!(advance_watermark(100, &[101, 103]), 101);
+        // Our first op is already foreign-contaminated: nothing advances.
+        assert_eq!(advance_watermark(100, &[102, 103]), 100);
+    }
+
+    #[test]
+    fn a_first_push_only_advances_when_the_folder_was_empty() {
+        assert_eq!(advance_watermark(0, &[1, 2]), 2);
+        // The folder already held ops from another device: ours start past them.
+        assert_eq!(advance_watermark(0, &[51, 52]), 0);
+    }
+
+    #[test]
+    fn an_empty_batch_leaves_the_watermark_alone() {
+        assert_eq!(advance_watermark(42, &[]), 42);
     }
 }

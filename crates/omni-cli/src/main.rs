@@ -405,7 +405,7 @@ async fn daemon(config_path: &Path) -> anyhow::Result<()> {
     }
 
     println!(
-        "omni-sync daemon: {} folder(s); watching for changes, polling the log every 2s",
+        "omni-sync daemon: {} folder(s); watching for changes, streaming the op log",
         config.folders.len()
     );
     tokio::signal::ctrl_c().await?;

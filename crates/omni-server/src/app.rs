@@ -1,13 +1,17 @@
 //! The axum application: `/api/v1` for devices, plus the dashboard.
 
+use std::convert::Infallible;
+
 use askama::Template as _;
 use axum::body::Bytes;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
+use tokio::sync::broadcast;
 
 use omni_core::{Op, OpKind};
 use omni_netproto::{
@@ -60,6 +64,7 @@ pub fn router(state: AppState) -> Router {
             post(register_member).get(list_members),
         )
         .route("/api/v1/folders/{id}/ops", post(submit_ops).get(list_ops))
+        .route("/api/v1/folders/{id}/ops/stream", get(stream_ops))
         .route("/api/v1/folders/{id}/resolve", post(resolve))
         .route("/api/v1/overwrites", get(list_overwrites))
         // Chunks.
@@ -396,6 +401,7 @@ async fn overwrite_resolve(
         restored_from: Some(version.id),
     };
     state.apply(&row.folder_id, "dashboard", op).await?;
+    state.publish_ops(&row.folder_id);
     state
         .store
         .blocking(move |conn| sync::mark_overwrite_resolved(conn, id))
@@ -741,10 +747,75 @@ async fn submit_ops(
         }
     }
 
+    // Wake any streaming client: its op log just grew.
+    state.publish_ops(&folder_id);
+
     Ok(Json(SubmitOpsResponse {
         applied,
         overwrites,
     }))
+}
+
+/// `GET /api/v1/folders/{id}/ops/stream` — the op log as server-sent events.
+///
+/// Every event carries the folder's current head seq. The client treats it as a
+/// wake-up ("something changed") and fetches the ops themselves through the
+/// ordinary `ops?since=` endpoint, so the diff logic stays in one place and the
+/// event payload stays tiny. A keep-alive comment flows on the default interval
+/// so a connection that died in the middle is noticed by both ends.
+async fn stream_ops(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+) -> Result<Response, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+
+    // Subscribe *before* reading the head: a change landing in between is then
+    // delivered as an event rather than missed between the two steps.
+    let mut events = state.subscribe_ops();
+    let head = folder_head(&state, &folder_id).await?;
+
+    let stream = async_stream::stream! {
+        yield Ok::<_, Infallible>(head_event(head));
+        loop {
+            let next = match events.recv().await {
+                Ok(changed) if changed == folder_id => folder_head(&state, &folder_id).await,
+                // Another folder changed; not ours to report.
+                Ok(_) => continue,
+                // We fell behind the broadcast buffer. The head still tells the
+                // client to resync, so a lag is not fatal.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    folder_head(&state, &folder_id).await
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            match next {
+                Ok(head) => yield Ok(head_event(head)),
+                Err(error) => {
+                    tracing::error!(%error, "op stream stopped");
+                    break;
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
+}
+
+/// An SSE event carrying a folder's op-log head.
+fn head_event(head: i64) -> Event {
+    Event::default().event("head").data(head.to_string())
+}
+
+/// The current op-log head of a folder.
+async fn folder_head(state: &AppState, folder_id: &str) -> Result<i64, StoreError> {
+    let id = folder_id.to_string();
+    state
+        .store
+        .blocking(move |conn| sync::folder_head(conn, &id))
+        .await
 }
 
 #[derive(Deserialize)]
@@ -833,6 +904,7 @@ async fn resolve(
         restored_from: Some(version.id),
     };
     let applied = state.apply(&folder_id, &device.id, op).await?;
+    state.publish_ops(&folder_id);
     Ok(Json(SubmitOpsResponse {
         applied: vec![AppliedOpDto {
             seq: applied.seq,

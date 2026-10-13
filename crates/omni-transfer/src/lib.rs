@@ -183,6 +183,99 @@ impl Client {
         }
         Ok(Some(response.bytes().await?.to_vec()))
     }
+
+    /// Open the server-sent event stream for a folder's op log.
+    ///
+    /// An event only says *that* the log grew; the ops themselves still come
+    /// from [`Client::ops_since`], so the diff logic lives in one place.
+    pub async fn stream_ops(&self, folder_id: &str) -> Result<OpStream, TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}/ops/stream"))?;
+        let response = self.auth(self.http.get(url)).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(TransferError::Status {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        Ok(OpStream {
+            response,
+            buffer: Vec::new(),
+        })
+    }
+}
+
+/// A live op-log stream for one folder.
+///
+/// The body is consumed incrementally: [`OpStream::next_head`] blocks until the
+/// next event arrives and returns the head seq it carried.
+pub struct OpStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+}
+
+impl OpStream {
+    /// The head seq from the next event, or `None` when the stream ends.
+    ///
+    /// Keep-alive comments carry no head and are skipped.
+    pub async fn next_head(&mut self) -> Result<Option<i64>, TransferError> {
+        loop {
+            match take_frame(&mut self.buffer) {
+                Frame::Ready(Some(head)) => return Ok(Some(head)),
+                Frame::Ready(None) => continue,
+                Frame::Incomplete => match self.response.chunk().await? {
+                    Some(chunk) => self.buffer.extend_from_slice(&chunk),
+                    None => return Ok(None),
+                },
+            }
+        }
+    }
+}
+
+/// One server-sent event frame, once a whole one is buffered.
+enum Frame {
+    /// A complete frame; the parsed `data:` payload, if it held one.
+    Ready(Option<i64>),
+    /// No frame separator yet — read more bytes.
+    Incomplete,
+}
+
+/// Take one whole frame off the front of `buffer`.
+///
+/// A frame ends at a blank line. Comment lines (keep-alives) start with `:` and
+/// carry no `data:`; head events do.
+fn take_frame(buffer: &mut Vec<u8>) -> Frame {
+    let Some((end, next)) = blank_line(buffer) else {
+        return Frame::Incomplete;
+    };
+    let frame: Vec<u8> = buffer.drain(..next).take(end).collect();
+    let mut head = None;
+    for line in frame.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(value) = line.strip_prefix(b"data:") {
+            let value = value.strip_prefix(b" ").unwrap_or(value);
+            head = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.trim().parse().ok());
+        }
+    }
+    Frame::Ready(head)
+}
+
+/// The blank line ending a frame, as `(content_end, next_frame_start)`.
+fn blank_line(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index + 1 < buffer.len() {
+        if &buffer[index..index + 2] == b"\n\n" {
+            return Some((index, index + 2));
+        }
+        if index + 3 < buffer.len() && &buffer[index..index + 4] == b"\r\n\r\n" {
+            return Some((index, index + 4));
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Turn a response into a typed value, or a status error.
@@ -225,5 +318,35 @@ mod tests {
             client.endpoint("/healthz").unwrap().as_str(),
             "https://sync.example.com/healthz"
         );
+    }
+
+    #[test]
+    fn an_sse_data_frame_yields_its_head() {
+        let mut buffer = b"event: head\ndata: 42\n\n".to_vec();
+        assert!(matches!(take_frame(&mut buffer), Frame::Ready(Some(42))));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_keep_alive_frame_carries_no_head() {
+        let mut buffer = b": keep-alive\n\n".to_vec();
+        assert!(matches!(take_frame(&mut buffer), Frame::Ready(None)));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_partial_frame_waits_for_more_bytes() {
+        let mut buffer = b"data: 7\n".to_vec();
+        assert!(matches!(take_frame(&mut buffer), Frame::Incomplete));
+        buffer.extend_from_slice(b"\n");
+        assert!(matches!(take_frame(&mut buffer), Frame::Ready(Some(7))));
+    }
+
+    #[test]
+    fn crlf_frames_and_several_frames_parse_in_order() {
+        let mut buffer = b"data: 1\r\n\r\ndata: 2\r\n\r\n".to_vec();
+        assert!(matches!(take_frame(&mut buffer), Frame::Ready(Some(1))));
+        assert!(matches!(take_frame(&mut buffer), Frame::Ready(Some(2))));
+        assert!(buffer.is_empty());
     }
 }

@@ -11,6 +11,7 @@ description = "The omni-sync server: /api/v1 plus the HTMX dashboard"
 anyhow.workspace = true
 argon2.workspace = true
 askama.workspace = true
+async-stream.workspace = true
 axum.workspace = true
 clap.workspace = true
 directories.workspace = true

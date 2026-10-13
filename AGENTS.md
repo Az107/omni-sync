@@ -48,12 +48,14 @@ binaries have `update`, which picks the release asset for the
 compiled-in target, verifies it against the release's `SHA256SUMS`, and
 installs it atomically; releases publish bare binaries for that purpose.
 
-**Change detection is watcher-driven.** Push runs on `notify` events
-(inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan; pull
-runs on a 2 s timer because remote changes are not filesystem events.
-Scanning reuses the last-synced chunk list for any file whose
-size/mtime/mode are unchanged, so an idle folder does no disk reads.
-Measured: ~1.6 s end-to-end propagation, ~5% of one core when idle.
+**Change detection is event-driven at both ends.** Push runs on `notify`
+events (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan;
+pull is woken by the server's op-log SSE stream
+(`GET /api/v1/folders/{id}/ops/stream`), with a 60 s fallback poll for a
+server that has no stream or a connection that died silently. Scanning
+reuses the last-synced chunk list for any file whose size/mtime/mode are
+unchanged, so an idle folder does no disk reads. Measured: ~1.6 s
+end-to-end propagation, ~5% of one core when idle.
 
 ## Commands
 
@@ -82,12 +84,16 @@ attaches the client and server to a GitHub release when a `v*` tag is
 pushed (or via **Run workflow**). Both pin Rust 1.89.0 to match
 `rust-toolchain.toml`.
 
-Release matrix — the client ships for six targets, the server for one:
+Release matrix — the client ships for six targets, the server for two:
 
 | package | targets |
 |---|---|
 | `omni-sync` (client) | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (native arm64 runner), `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
-| `omni-sync-server` | `x86_64-unknown-linux-gnu` (it ships as a container off the same tree) |
+| `omni-sync-server` | `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` (native arm64 runner) |
+
+Both server targets matter: the space-elevator host is arm64, so the
+in-container `update` needs an `aarch64` asset to exist, not just the
+container build.
 
 `ubuntu-24.04-arm` is a GitHub-hosted arm64 Linux runner (free for public
 repos), so `aarch64-unknown-linux-gnu` is native rather than cross-built.
@@ -149,17 +155,25 @@ twice returns `400 invalid, expired or already-used pairing code`.
   `a.agent.db`), not just its directory. Two clients sharing one DB was a
   real bug: they clobbered each other's `file_state` and every file
   became a delete/overwrite storm.
-- **`omni-agent::Engine` pushes before it pulls, and records its own
-  result.** A push sets `file_state` (with the returned `version_id`) and
-  advances `applied_seq` past its own ops, so the following pull never
-  re-applies what this device just sent. `base_version_id` comes from the
-  per-path version map, and is sent as `None` (not `0`) for a path that
-  has never synced.
-- **Push and pull run on separate cadences, on purpose.** Push is
-  `notify`-driven (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s
-  safety scan, because it must walk and hash the tree. Pull is a 2 s timer
-  of the op log, because a remote change is not a local filesystem event;
-  SSE/WebSocket push is the eventual replacement. Scanning reuses the
+- **`omni-agent::Engine` pulls before it pushes, and records only what it
+  applied.** `run` does one pull before the loop, so a first sync sees what
+  the server already has instead of reporting a whole directory as an
+  overwrite. A push then sets `file_state` (with the returned
+  `version_id`) and advances `applied_seq` — but *only over ops it really
+  applied* (`advance_watermark`). Op ids are one global sequence, so a
+  foreign op can land inside our batch (we take 101, another device takes
+  102, we take 103); jumping the watermark to our last seq would skip 102
+  for good, which is what made a change from one device never reach
+  another. `base_version_id` comes from the per-path version map, and is
+  sent as `None` (not `0`) for a path that has never synced.
+- **Push and pull are both event-driven.** Push is `notify`-driven
+  (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan,
+  because it must walk and hash the tree. Pull is woken by the server's
+  op-log SSE stream (`GET /api/v1/folders/{id}/ops/stream`), which fires
+  the moment a folder's op log grows; a 60 s fallback poll covers a server
+  without the stream and a connection that dies without the socket
+  noticing. The stream carries only the head seq — the ops still come from
+  `ops?since=`, so the diff has one implementation. Scanning reuses the
   last-synced chunk list for files whose size/mtime/mode are unchanged, so
   an idle folder does no disk reads. Inotify can drop events (queue
   overflow, new directories, NFS), which is what the safety scan is for.
