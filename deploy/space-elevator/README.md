@@ -182,14 +182,18 @@ first deploy.
 
 ## Status
 
-**Verified from the outside.**
+**0.2.0 verified from the outside.**
 
-- `GET /healthz` → `{"ok":true,"version":"0.1.0"}`
-- `GET /` → `303` to login; login renders the dashboard; `/devices` mints
-  a pairing code; `/static/app.css` → `200`.
+- `GET /healthz` → `{"ok":true,"version":"0.2.0"}`
+- `GET /` → `303` to login; login renders the redesigned dashboard;
+  `/devices` mints a pairing code; `/static/app.css` → `200`;
+  `/static/fonts/archivo-latin.woff2` → `200 font/woff2`.
 - A real client enrolled against the public URL, joined a folder, and
   pushed a file; `GET /api/v1/folders/{id}/manifest` over the public URL
   showed it with the expected size and content hash.
+- `omni-sync-server update --check` inside the running container reports
+  the release as current, so the in-container update path works on the
+  trixie base.
 
 The port-80/root detail above was found the hard way: the 8787 non-root
 build reported `running` yet returned `502`, which is exactly the failure
