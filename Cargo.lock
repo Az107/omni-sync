@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "omni-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "notify",
@@ -1345,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "omni-chunk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "sha2 0.10.9",
@@ -1353,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "omni-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1377,14 +1377,14 @@ dependencies = [
 
 [[package]]
 name = "omni-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "omni-netproto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "omni-core",
@@ -1394,7 +1394,7 @@ dependencies = [
 
 [[package]]
 name = "omni-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "omni-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omni-core",
  "rusqlite",
@@ -1437,7 +1437,7 @@ dependencies = [
 
 [[package]]
 name = "omni-transfer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omni-netproto",
  "reqwest",
@@ -1447,7 +1447,7 @@ dependencies = [
 
 [[package]]
 name = "omni-update"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "reqwest",

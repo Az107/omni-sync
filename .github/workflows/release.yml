@@ -1,6 +1,6 @@
 name: Release
 
-# Tag a commit `v0.1.0` (or run this manually with a tag) to attach the client
+# Tag a commit `v0.2.0` (or run this manually with a tag) to attach the client
 # (linux/macOS/Windows, x64 + arm64) and the server to a GitHub release.
 on:
   push:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to publish (e.g. v0.1.0). Must already exist.
+        description: Tag to publish (e.g. v0.2.0). Must already exist.
         required: true
 
 permissions:
@@ -39,8 +39,11 @@ jobs:
           - { os: macos-latest,   target: x86_64-apple-darwin,       package: omni-cli,    bin: omni-sync,        native: false }
           - { os: windows-latest, target: aarch64-pc-windows-msvc,   package: omni-cli,    bin: omni-sync,        native: false }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,    package: omni-cli,    bin: omni-sync,        native: true }
-          # Server — linux/x64 only; it ships as a container off the same tree.
-          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  package: omni-server, bin: omni-sync-server, native: true }
+          # Server — linux/x64 and arm64. The container is built on the host's
+          # architecture, so the in-container self-updater needs an asset for
+          # whichever arch the host runs.
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  package: omni-server, bin: omni-sync-server, native: true }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, package: omni-server, bin: omni-sync-server, native: true }
     steps:
       - uses: actions/checkout@v7
 
