@@ -64,6 +64,10 @@ jobs:
         with:
           toolchain: 1.89.0
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Without a per-entry key both matrix jobs resolve to the same
+          # job-based cache key and overwrite each other's target dir.
+          key: ${{ matrix.bin }}
 
       # aws-lc-rs (reqwest's rustls backend) and rusqlite's bundled SQLite need
       # cmake + a C compiler; the hosted runner already has both.

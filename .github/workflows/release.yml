@@ -1,7 +1,7 @@
 name: Release
 
-# Tag a commit `v0.1.0` (or run this manually with a tag) to attach both
-# binaries to a GitHub release.
+# Tag a commit `v0.1.0` (or run this manually with a tag) to attach the client
+# (linux/macOS/Windows, x64 + arm64) and the server to a GitHub release.
 on:
   push:
     tags: ["v*"]
@@ -17,41 +17,78 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   TAG: ${{ inputs.tag || github.ref_name }}
+  # aws-lc-sys would otherwise need NASM on Windows x64. The GitHub Windows
+  # image has no NASM; when this is set (and no assembler is found) it links
+  # the crate's prebuilt assembly objects instead. It is ignored everywhere
+  # except Windows x86-64.
+  AWS_LC_SYS_PREBUILT_NASM: "1"
 
 jobs:
   build:
-    name: build ${{ matrix.bin }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.bin }} ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - package: omni-cli
-            bin: omni-sync
-          - package: omni-server
-            bin: omni-sync-server
+          # Client — linux, macOS and Windows, arm64 and x64.
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  package: omni-cli,    bin: omni-sync,        native: true }
+          - { os: macos-latest,   target: aarch64-apple-darwin,      package: omni-cli,    bin: omni-sync,        native: true }
+          - { os: macos-latest,   target: x86_64-apple-darwin,       package: omni-cli,    bin: omni-sync,        native: false }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc,   package: omni-cli,    bin: omni-sync,        native: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,    package: omni-cli,    bin: omni-sync,        native: true }
+          # Server — linux/x64 only; it ships as a container off the same tree.
+          - { os: ubuntu-latest,  target: x86_64-unknown-linux-gnu,  package: omni-server, bin: omni-sync-server, native: true }
     steps:
       - uses: actions/checkout@v7
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.89.0
+          targets: ${{ matrix.target }}
+
+      # One cache per target+package. Without an explicit key every matrix
+      # entry would resolve to the same job-based key and they would overwrite
+      # each other's target dir.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.package }}
 
-      - run: cargo build --release --locked -p ${{ matrix.package }}
+      - run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
 
-      - name: Package the tarball
+      # Cross-compiled targets (macOS x64, Windows arm64) cannot be executed
+      # on the runner, so only the native ones are smoke-tested.
+      - name: Smoke test (unix)
+        if: matrix.native && runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/release/${{ matrix.bin }} --version
+
+      - name: Smoke test (windows)
+        if: matrix.native && runner.os == 'Windows'
+        run: .\target\${{ matrix.target }}\release\${{ matrix.bin }}.exe --version
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          version="${TAG#v}"
+          name="${{ matrix.bin }}-${TAG#v}-${{ matrix.target }}"
           stage="$(mktemp -d)"
-          install -m 0755 "target/release/${{ matrix.bin }}" "$stage/"
-          tar -C "$stage" -czf "${{ matrix.bin }}-${version}-linux-x86_64.tar.gz" \
-            "${{ matrix.bin }}"
+          install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
+          tar -C "$stage" -czf "${name}.tar.gz" "${{ matrix.bin }}"
+          echo "ASSET=${name}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "${{ matrix.bin }}-$($env:TAG -replace '^v','')-${{ matrix.target }}"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}.exe" `
+            -DestinationPath "$name.zip"
+          "ASSET=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.bin }}-linux-x86_64
-          path: ${{ matrix.bin }}-*-linux-x86_64.tar.gz
+          name: ${{ matrix.bin }}-${{ matrix.target }}
+          path: ${{ env.ASSET }}
           if-no-files-found: error
 
   publish:
@@ -68,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
 
       - name: Create or update the release
         env:
