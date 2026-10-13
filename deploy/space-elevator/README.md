@@ -112,13 +112,38 @@ omni-sync daemon
 The client appends API paths *under* its base URL, so the `/app/omni-sync`
 prefix needs no special configuration.
 
-## Persistence
+## Persistence — and the compose-hash footgun
 
 - `omnidata` → `/data` (content-addressed chunk store)
 - `omnistate` → `/state` (SQLite: devices, folders, ops, versions, overwrites)
 
-Platform-managed volumes, backed up before an update and restored if the
-new release fails to start. Keep the logical volume names unchanged.
+**space-elevator names these volumes by a hash of the compose stack, not
+by the logical volume name.** Editing `compose.yml` — even to add a
+`restart:` policy or an environment variable — changes the hash, so the
+next `se apps update` points the app at *new, empty* volumes and the data
+looks gone.
+
+The update prints "persistent data was preserved" and writes a backup
+under `~services/.local/share/space-elevator/backups/<app-id>/<release>/`,
+but that manifest is metadata-only (`"storage": null`): it does **not**
+snapshot the volume. The old volumes are not deleted, so the data is still
+on disk and can be carried across:
+
+```sh
+# find the old volumes (64-hex names); the old pair predates this deploy
+sudo -n -u services -- podman volume ls -q
+# checkpoint the old DB so its WAL is folded in, then copy server.db and
+# chunks/ into the volumes the *new* container mounts (podman inspect),
+# with the container stopped, and start it again.
+```
+
+The safe rule: **treat `compose.yml` as frozen.** Change it as rarely as
+possible, and when you must, plan to move the volume contents by hand.
+
+Keep the logical volume names (`omnidata`, `omnistate`) and the service
+name (`web`) unchanged regardless: they are what the compose stack
+declares.
+
 
 ## Status
 
