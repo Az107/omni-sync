@@ -32,3 +32,17 @@ cargo +1.89.0 test --workspace
 
 The workspace floor is Rust 1.89 / edition 2024. The `default` toolchain
 on this host is older, so use `+1.89.0` (or rely on `rust-toolchain.toml`).
+
+## Releases
+
+Tagging `v*` (or running the **Release** workflow manually with a tag)
+builds and attaches prebuilt binaries, each with a `SHA256SUMS`:
+
+| package | targets |
+|---|---|
+| `omni-sync` (client) | linux `x86_64`, macOS `arm64` + `x86_64`, Windows `arm64` + `x86_64` |
+| `omni-sync-server` | linux `x86_64` (also ships as a container) |
+
+macOS and Windows builds are `tar.gz` / `zip` respectively. The macOS
+`x86_64` and Windows `arm64` builds are cross-compiled, so they are not
+executed in CI; the others are smoke-tested before packaging.

@@ -65,9 +65,24 @@ cargo run -p omni-cli -- enroll --server http://127.0.0.1:8787 --code ABCD-EFGHJ
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
 and release-builds both binaries on every push and PR; `release.yml`
-attaches `omni-sync` and `omni-sync-server` tarballs to a GitHub release
-when a `v*` tag is pushed. Both pin Rust 1.89.0 to match
+attaches the client and server to a GitHub release when a `v*` tag is
+pushed (or via **Run workflow**). Both pin Rust 1.89.0 to match
 `rust-toolchain.toml`.
+
+Release matrix — the client ships for six targets, the server for one:
+
+| package | targets |
+|---|---|
+| `omni-sync` (client) | `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `aarch64-pc-windows-msvc` |
+| `omni-sync-server` | `x86_64-unknown-linux-gnu` (it ships as a container off the same tree) |
+
+`Swatinem/rust-cache` is keyed per target *and* package (`key: <target>-
+<package>`); the default job-based key is shared by every matrix entry, so
+without this the entries overwrite each other's `target/` dir. Only native
+targets are smoke-tested — `x86_64-apple-darwin` and
+`aarch64-pc-windows-msvc` are cross-built and cannot run on the runner.
+`AWS_LC_SYS_PREBUILT_NASM=1` is set because the Windows image has no NASM
+and `aws-lc-sys` x64 builds need it (ignored off Windows x86-64).
 
 ### M0 smoke test
 
