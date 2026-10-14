@@ -1,9 +1,12 @@
 //! The `omni-sync` client binary.
 //!
 //! `enroll` registers the device (by pairing code or magic link); `add` records
-//! a folder to watch; `daemon` runs the watcher/sync loop for every recorded
-//! folder; `update` installs a newer release from GitHub.
+//! a folder to watch and runs its initial sync; `daemon` runs the watcher/sync
+//! loop for every recorded folder and reloads when the config changes; `flush`
+//! forces an immediate sync cycle; `update` installs a newer release from
+//! GitHub.
 
+mod daemon;
 mod link;
 mod wizard;
 
@@ -14,7 +17,8 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow, bail};
 use clap::{Parser, Subcommand};
 use directories::ProjectDirs;
-use omni_agent::{Engine, EngineConfig};
+use omni_agent::{Engine, EngineConfig, HoldRule, SyncMode, path_bytes};
+use omni_netproto::FolderDto;
 use omni_store::Store;
 
 #[derive(Parser)]
@@ -34,7 +38,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register this device. Prompt-free with --server/--code or --link.
+    /// Register this device. Prompt-free with --server/--code.
     Enroll {
         /// Server base URL, e.g. https://sync.example.com (or .../app/omni-sync).
         #[arg(long)]
@@ -55,21 +59,40 @@ enum Command {
         #[arg(long, default_value_t = 180)]
         timeout: u64,
     },
-    /// Watch a shared folder (by id) at a local path. Prompts if args are omitted.
+    /// Watch a shared folder (by id or name) at a local path. Prompts if args are omitted.
     Add {
-        /// Folder id from `omni-sync folders`; prompted for if omitted.
+        /// Folder id or name from `omni-sync folders`; prompted for if omitted.
         folder: Option<String>,
         /// Local directory to watch; prompted for if omitted.
         path: Option<PathBuf>,
+        /// Sync mode: `live` or `on_close`.
         #[arg(long)]
         mode: Option<String>,
+        /// Create the folder on the server if it does not exist yet.
+        #[arg(long, visible_alias = "new")]
+        create: bool,
+        /// Process name globs that hold this folder while running (e.g. `steam*`).
+        #[arg(long = "hold-while-process", value_name = "GLOB")]
+        hold_while_process: Vec<String>,
+        /// Quiet timeout in seconds for `on_close` holds.
+        #[arg(long = "quiet-timeout", value_name = "SECS")]
+        quiet_timeout_secs: Option<u64>,
+    },
+    /// Manage shared folders on the server (`create`, `list`).
+    Folder {
+        #[command(subcommand)]
+        action: FolderAction,
     },
     /// Run the watcher/sync daemon.
     Daemon,
     /// List folders this server knows about.
     Folders,
-    /// Show per-folder sync state.
-    Status,
+    /// Show per-folder sync state and any held files.
+    Status {
+        /// Filter to a single folder (by id or local path).
+        #[arg(long)]
+        folder: Option<String>,
+    },
     /// Print the resolved config and store status.
     Doctor,
     /// Install a newer release from GitHub.
@@ -94,36 +117,63 @@ enum Command {
         version: i64,
     },
     /// Override a hold and sync now.
+    #[command(visible_alias = "sync")]
     Flush {
         folder: Option<String>,
         path: Option<String>,
     },
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct ClientConfig {
-    server: String,
-    device_id: String,
-    token: String,
-    #[serde(default)]
-    folders: Vec<WatchEntry>,
+#[derive(Subcommand)]
+enum FolderAction {
+    /// Create a shared folder on the server and print its id.
+    Create { name: String },
+    /// List folders on the server.
+    List,
 }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct WatchEntry {
-    folder_id: String,
-    path: PathBuf,
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ClientConfig {
+    pub(crate) server: String,
+    pub(crate) device_id: String,
+    pub(crate) token: String,
+    #[serde(default)]
+    pub(crate) folders: Vec<WatchEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct WatchEntry {
+    pub(crate) folder_id: String,
+    pub(crate) path: PathBuf,
     #[serde(default = "default_mode")]
-    mode: String,
+    pub(crate) mode: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hold_while_process: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quiet_timeout_secs: Option<u64>,
 }
 
 fn default_mode() -> String {
     "live".to_string()
 }
 
+pub(crate) fn engine_config(entry: &WatchEntry) -> anyhow::Result<EngineConfig> {
+    let mode: SyncMode = entry.mode.parse().map_err(|error: String| anyhow!(error))?;
+    let hold_rule = HoldRule::new(
+        entry.hold_while_process.clone(),
+        entry.quiet_timeout_secs.unwrap_or(0),
+    );
+    Ok(
+        EngineConfig::new(entry.folder_id.clone(), entry.path.clone())
+            .with_mode(mode)
+            .with_hold_rule(hold_rule),
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -154,15 +204,39 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Add { folder, path, mode } => add(&config_path, folder, path, mode).await,
-        Command::Daemon => daemon(&config_path).await,
+        Command::Add {
+            folder,
+            path,
+            mode,
+            create,
+            hold_while_process,
+            quiet_timeout_secs,
+        } => {
+            add(
+                &config_path,
+                folder,
+                path,
+                mode,
+                create,
+                hold_while_process,
+                quiet_timeout_secs,
+            )
+            .await
+        }
+        Command::Folder { action } => folder_cmd(&config_path, action).await,
+        Command::Daemon => daemon::run(&config_path).await,
         Command::Folders => folders(&config_path).await,
-        Command::Status => status(&config_path),
+        Command::Status { folder } => status(&config_path, folder.as_deref()),
         Command::Doctor => doctor(&config_path).await,
         Command::Update { check, force, to } => update(check, force, to).await,
-        Command::History { .. } | Command::Resolve { .. } | Command::Flush { .. } => {
-            println!("not implemented yet — it lands in M5 (see plan.md).");
-            Ok(())
+        Command::History { folder, path } => history(&config_path, &folder, &path).await,
+        Command::Resolve {
+            folder,
+            path,
+            version,
+        } => resolve(&config_path, &folder, &path, version).await,
+        Command::Flush { folder, path } => {
+            flush(&config_path, folder.as_deref(), path.as_deref()).await
         }
     }
 }
@@ -214,7 +288,7 @@ async fn enroll(
                 };
                 (server, code)
             }
-            _ => bail!("--server and --code (or --link) are required when not on a terminal"),
+            _ => bail!("--server and --code are required when not on a terminal"),
         }
     };
 
@@ -242,22 +316,99 @@ async fn enroll(
     Ok(())
 }
 
+/// Match a user-supplied folder identifier against the server's folder list by
+/// exact id first, then by unambiguous name.
+fn match_folder(folders: &[FolderDto], query: &str) -> anyhow::Result<Option<FolderDto>> {
+    if let Some(exact) = folders.iter().find(|folder| folder.id == query) {
+        return Ok(Some(exact.clone()));
+    }
+    let by_name: Vec<&FolderDto> = folders
+        .iter()
+        .filter(|folder| folder.name == query)
+        .collect();
+    match by_name.as_slice() {
+        [] => Ok(None),
+        [single] => Ok(Some((*single).clone())),
+        _ => {
+            bail!("multiple folders on the server are named '{query}'; pass the folder id instead")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn add(
     config_path: &Path,
     folder: Option<String>,
     path: Option<PathBuf>,
     mode: Option<String>,
+    create: bool,
+    hold_while_process: Vec<String>,
+    quiet_timeout_secs: Option<u64>,
 ) -> anyhow::Result<()> {
     let mut config = load_config(config_path)?;
     let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
 
-    // Which server folder?
-    let folder_id = match folder {
-        Some(folder) => folder,
-        None if interactive() => {
-            let folders = client.list_folders().await?;
-            wizard::select_folder(&folders)?
+    let mode = match mode {
+        Some(mode) => {
+            let parsed: SyncMode = mode.parse().map_err(|error: String| anyhow!(error))?;
+            parsed.as_str().to_string()
         }
+        None if interactive() => {
+            if wizard::confirm("Sync in live mode? (no = on_close)", true)? {
+                "live".to_string()
+            } else {
+                "on_close".to_string()
+            }
+        }
+        None => "live".to_string(),
+    };
+
+    // Resolve or create the server folder *before* mutating local state.
+    let server_folders = client
+        .list_folders()
+        .await
+        .context("listing folders on the server")?;
+    let folder_id = match folder {
+        Some(query) => match match_folder(&server_folders, &query)? {
+            Some(found) => found.id,
+            None if create => {
+                let created = client
+                    .create_folder(&query)
+                    .await
+                    .with_context(|| format!("creating folder '{query}'"))?;
+                println!("created folder {} ({})", created.name, created.id);
+                created.id
+            }
+            None if interactive() => {
+                if wizard::confirm(
+                    &format!("Folder '{query}' does not exist on the server; create it?"),
+                    true,
+                )? {
+                    let created = client
+                        .create_folder(&query)
+                        .await
+                        .with_context(|| format!("creating folder '{query}'"))?;
+                    println!("created folder {} ({})", created.name, created.id);
+                    created.id
+                } else {
+                    bail!("folder '{query}' does not exist on the server");
+                }
+            }
+            None => bail!(
+                "folder '{query}' does not exist on the server (create it with `omni-sync folder create <name>` or pass `--create`)"
+            ),
+        },
+        None if interactive() => match wizard::select_or_create_folder(&server_folders)? {
+            wizard::FolderChoice::Existing(id) => id,
+            wizard::FolderChoice::CreateNew(name) => {
+                let created = client
+                    .create_folder(&name)
+                    .await
+                    .with_context(|| format!("creating folder '{name}'"))?;
+                println!("created folder {} ({})", created.name, created.id);
+                created.id
+            }
+        },
         None => bail!(
             "a folder id is required when not on a terminal; run `omni-sync folders` or pass one"
         ),
@@ -270,18 +421,6 @@ async fn add(
         None => bail!("a local path is required when not on a terminal"),
     };
     let path = prepare_path(&path, interactive())?;
-
-    let mode = match mode {
-        Some(mode) => mode,
-        None if interactive() => {
-            if wizard::confirm("Sync in live mode? (no = on_close)", true)? {
-                "live".to_string()
-            } else {
-                "on_close".to_string()
-            }
-        }
-        None => "live".to_string(),
-    };
 
     if interactive()
         && !wizard::confirm(
@@ -296,22 +435,69 @@ async fn add(
         return Ok(());
     }
 
-    config.folders.retain(|entry| entry.folder_id != folder_id);
-    config.folders.push(WatchEntry {
+    // Record membership on the server before writing the local config so a
+    // rejected folder never leaves a broken entry in `client.toml`.
+    let root = path_bytes(&path);
+    client
+        .register_member(&folder_id, &root, "both")
+        .await
+        .with_context(|| format!("registering membership for folder {folder_id}"))?;
+
+    let new_entry = WatchEntry {
         folder_id: folder_id.clone(),
         path: path.clone(),
-        mode: mode.clone(),
-    });
+        mode,
+        hold_while_process,
+        quiet_timeout_secs,
+    };
+    let cfg = engine_config(&new_entry)?;
+
+    config.folders.retain(|entry| entry.folder_id != folder_id);
+    config.folders.push(new_entry);
     save_config(config_path, &config)?;
 
-    // Record membership on the server (best effort: an older server may not
-    // know this endpoint, which must not stop the local add).
-    let root = path.as_os_str().as_encoded_bytes().to_vec();
-    if let Err(error) = client.register_member(&folder_id, &root, "both").await {
-        eprintln!("note: the server did not record this membership ({error})");
+    // Start syncing immediately: if a daemon is running, tell it to reload its
+    // config and sync the new folder; otherwise run one initial sync cycle
+    // in-process so existing files move right away.
+    match daemon::try_send_command(
+        config_path,
+        daemon::ControlCommand::ReloadAndSync {
+            folder_id: Some(folder_id.clone()),
+        },
+    )
+    .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let store = Store::open_agent(&agent_db_path(config_path))?;
+            let engine = Engine::new(client, store, cfg);
+            if let Err(error) = engine.sync_once().await {
+                tracing::warn!(folder = %folder_id, %error, "initial sync failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "daemon control handoff failed");
+        }
     }
 
     println!("watching folder {} at {}", folder_id, path.display());
+    Ok(())
+}
+
+async fn folder_cmd(config_path: &Path, action: FolderAction) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+    match action {
+        FolderAction::Create { name } => {
+            let created = client.create_folder(&name).await?;
+            println!("{}", created.id);
+        }
+        FolderAction::List => {
+            for folder in client.list_folders().await? {
+                println!("{}  {}", folder.id, folder.name);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -377,41 +563,6 @@ async fn update(check: bool, force: bool, to: Option<String>) -> anyhow::Result<
     Ok(())
 }
 
-async fn daemon(config_path: &Path) -> anyhow::Result<()> {
-    let config = load_config(config_path)?;
-    if config.folders.is_empty() {
-        return Err(anyhow!(
-            "no folders configured — run `omni-sync add <folder-id> <path>` first"
-        ));
-    }
-    let store = Store::open_agent(&agent_db_path(config_path))?;
-
-    for entry in config.folders.iter().cloned() {
-        let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
-        let engine = Engine::new(
-            client,
-            store.clone(),
-            EngineConfig {
-                folder_id: entry.folder_id.clone(),
-                root: entry.path.clone(),
-            },
-        );
-        tracing::info!(folder = %entry.folder_id, path = %entry.path.display(), "syncing");
-        tokio::spawn(async move {
-            if let Err(error) = engine.run().await {
-                tracing::error!(%error, "sync engine stopped");
-            }
-        });
-    }
-
-    println!(
-        "omni-sync daemon: {} folder(s); watching for changes, streaming the op log",
-        config.folders.len()
-    );
-    tokio::signal::ctrl_c().await?;
-    Ok(())
-}
-
 async fn folders(config_path: &Path) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
@@ -421,23 +572,149 @@ async fn folders(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn status(config_path: &Path) -> anyhow::Result<()> {
+fn status(config_path: &Path, filter: Option<&str>) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let store = Store::open_agent(&agent_db_path(config_path))?;
     for entry in &config.folders {
+        if let Some(target) = filter
+            && entry.folder_id != target
+            && entry.path.as_path() != Path::new(target)
+        {
+            continue;
+        }
         let folder = entry.folder_id.clone();
         let synced = store.with(move |conn| omni_store::agent::manifest(conn, &folder))?;
         let folder = entry.folder_id.clone();
         let seq = store.with(move |conn| omni_store::agent::applied_seq(conn, &folder))?;
+        let folder = entry.folder_id.clone();
+        let held = store.with(move |conn| omni_store::agent::held_files(conn, &folder))?;
         println!(
-            "{}  {}  {} file(s) synced  applied_seq={}",
+            "{}  {}  mode={}  {} file(s) synced  {} held  applied_seq={}",
             entry.folder_id,
             entry.path.display(),
+            entry.mode,
             synced.len(),
+            held.len(),
             seq
+        );
+        for (path, reason) in held {
+            println!("  held {} ({reason})", String::from_utf8_lossy(&path));
+        }
+    }
+    Ok(())
+}
+
+async fn flush(config_path: &Path, folder: Option<&str>, path: Option<&str>) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    if config.folders.is_empty() {
+        bail!("no folders configured — run `omni-sync add <folder-id> <path>` first");
+    }
+
+    // If a daemon is already running for this config, ask it to execute the
+    // flush so we never run a second concurrent engine on the same database.
+    if let Some(synced) = daemon::try_send_command(
+        config_path,
+        daemon::ControlCommand::Flush {
+            folder: folder.map(str::to_owned),
+            path: path.map(str::to_owned),
+        },
+    )
+    .await?
+    {
+        println!("synced {synced} folder(s) via running daemon");
+        return Ok(());
+    }
+
+    let store = Store::open_agent(&agent_db_path(config_path))?;
+    let target_path = path.map(|p| path_bytes(Path::new(p)));
+    let mut synced = 0usize;
+
+    for entry in &config.folders {
+        let matched = match folder {
+            None => true,
+            Some(filter) => entry.folder_id == filter || entry.path.as_path() == Path::new(filter),
+        };
+        if !matched {
+            continue;
+        }
+        let cfg = engine_config(entry)?;
+        let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+        let engine = Engine::new(client, store.clone(), cfg);
+        engine.flush_once(target_path.as_deref()).await?;
+        synced += 1;
+    }
+
+    if synced == 0 {
+        bail!(
+            "folder '{}' is not in {}",
+            folder.unwrap_or_default(),
+            config_path.display()
+        );
+    }
+    println!("synced {synced} folder(s)");
+    Ok(())
+}
+
+async fn history(config_path: &Path, folder: &str, path: &str) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+    let folder_id = resolve_folder_id(&config, &client, folder).await?;
+    let raw_path = path_bytes(Path::new(path));
+    let entries = client.history(&folder_id, &raw_path).await?;
+    if entries.is_empty() {
+        println!("no versions recorded for {path}");
+        return Ok(());
+    }
+    for entry in entries {
+        let marker = if entry.active { "*" } else { " " };
+        let restored = entry
+            .restored_from
+            .map(|v| format!(" (restored from v{v})"))
+            .unwrap_or_default();
+        println!(
+            "{marker} v{}  seq={}  {} B  device={}  {}{restored}",
+            entry.version_id, entry.seq, entry.size, entry.device_id, entry.created_at
         );
     }
     Ok(())
+}
+
+async fn resolve(config_path: &Path, folder: &str, path: &str, version: i64) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
+    let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+    let folder_id = resolve_folder_id(&config, &client, folder).await?;
+    let raw_path = path_bytes(Path::new(path));
+    let response = client.resolve(&folder_id, &raw_path, version).await?;
+    if let Some(applied) = response.applied.first() {
+        println!(
+            "restored {} to version {} -> new version {} (seq {})",
+            path, version, applied.version_id, applied.seq
+        );
+    }
+    // Pull the restored version locally if this device watches the folder.
+    if config.folders.iter().any(|e| e.folder_id == folder_id) {
+        let _ = flush(config_path, Some(&folder_id), Some(path)).await;
+    }
+    Ok(())
+}
+
+async fn resolve_folder_id(
+    config: &ClientConfig,
+    client: &omni_transfer::Client,
+    query: &str,
+) -> anyhow::Result<String> {
+    if let Some(entry) = config
+        .folders
+        .iter()
+        .find(|e| e.folder_id == query || e.path.as_path() == Path::new(query))
+    {
+        return Ok(entry.folder_id.clone());
+    }
+    let folders = client.list_folders().await?;
+    match match_folder(&folders, query)? {
+        Some(found) => Ok(found.id),
+        None => bail!("unknown folder '{query}'"),
+    }
 }
 
 async fn doctor(config_path: &Path) -> anyhow::Result<()> {
@@ -458,7 +735,7 @@ async fn doctor(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn load_config(explicit: &Path) -> anyhow::Result<ClientConfig> {
+pub(crate) fn load_config(explicit: &Path) -> anyhow::Result<ClientConfig> {
     let text = std::fs::read_to_string(explicit).with_context(|| {
         format!(
             "reading {} (run `omni-sync enroll` first)",
@@ -484,7 +761,7 @@ fn client_config_path(explicit: Option<&Path>) -> PathBuf {
 
 /// The client database lives next to the config, keyed by the config's name, so
 /// two clients in one directory (as in tests and the e2e script) never share it.
-fn agent_db_path(config_path: &Path) -> PathBuf {
+pub(crate) fn agent_db_path(config_path: &Path) -> PathBuf {
     let stem = config_path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -493,25 +770,110 @@ fn agent_db_path(config_path: &Path) -> PathBuf {
     dir.join(format!("{stem}.agent.db"))
 }
 
+/// Write `contents` to `path` atomically with `0600` permissions via a
+/// same-directory temporary file and rename, so a config watcher never reads a
+/// truncated or half-written file.
 #[cfg(unix)]
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    if let Some(parent) = path.parent() {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(contents.as_bytes())?;
+    let tmp = temp_sibling(path);
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
-    std::fs::write(path, contents)?;
+pub(crate) fn write_private(path: &Path, contents: &str) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = temp_sibling(path);
+    std::fs::write(&tmp, contents)?;
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
+    }
     Ok(())
+}
+
+fn temp_sibling(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".tmp.{}", std::process::id()));
+    path.with_file_name(name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dto(id: &str, name: &str) -> FolderDto {
+        FolderDto {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn folder_matching_prefers_exact_id_then_unique_name() {
+        let folders = vec![
+            dto("f-1", "Docs"),
+            dto("f-2", "Photos"),
+            dto("f-3", "Dup"),
+            dto("f-4", "Dup"),
+        ];
+
+        assert_eq!(
+            match_folder(&folders, "f-2").unwrap(),
+            Some(dto("f-2", "Photos"))
+        );
+        assert_eq!(
+            match_folder(&folders, "Docs").unwrap(),
+            Some(dto("f-1", "Docs"))
+        );
+        assert_eq!(match_folder(&folders, "Missing").unwrap(), None);
+        assert!(match_folder(&folders, "Dup").is_err());
+    }
+
+    #[test]
+    fn engine_config_validates_the_sync_mode() {
+        let mut entry = WatchEntry {
+            folder_id: "f1".into(),
+            path: PathBuf::from("/tmp"),
+            mode: "on_close".into(),
+            hold_while_process: vec!["steam*".into()],
+            quiet_timeout_secs: Some(30),
+        };
+        let cfg = engine_config(&entry).unwrap();
+        assert_eq!(cfg.mode, SyncMode::OnClose);
+        assert_eq!(cfg.hold_rule.process_globs, vec!["steam*".to_string()]);
+        assert_eq!(cfg.hold_rule.quiet_timeout_secs, 30);
+
+        entry.mode = "bogus".into();
+        assert!(engine_config(&entry).is_err());
+    }
+
+    #[test]
+    fn atomic_private_write_replaces_the_target_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("client.toml");
+        write_private(&target, "first = 1\n").unwrap();
+        write_private(&target, "second = 2\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "second = 2\n");
+    }
 }

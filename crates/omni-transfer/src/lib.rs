@@ -6,8 +6,9 @@
 
 use omni_netproto::{
     ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
-    FoldersResponse, ManifestResponse, MembersResponse, OpDto, OpsResponse, PROTOCOL_VERSION,
-    RegisterMemberRequest, SubmitOpsRequest, SubmitOpsResponse,
+    FoldersResponse, HistoryEntryDto, HistoryResponse, ManifestResponse, MembersResponse, OpDto,
+    OpsResponse, PROTOCOL_VERSION, RegisterMemberRequest, ResolveRequest, SubmitOpsRequest,
+    SubmitOpsResponse,
 };
 use reqwest::{RequestBuilder, StatusCode, Url};
 use serde::de::DeserializeOwned;
@@ -153,6 +154,32 @@ impl Client {
     ) -> Result<OpsResponse, TransferError> {
         let url = self.endpoint(&format!("/api/v1/folders/{folder_id}/ops?since={since}"))?;
         json(self.auth(self.http.get(url)).send().await?).await
+    }
+
+    pub async fn history(
+        &self,
+        folder_id: &str,
+        path: &[u8],
+    ) -> Result<Vec<HistoryEntryDto>, TransferError> {
+        let mut url = self.endpoint(&format!("/api/v1/folders/{folder_id}/history"))?;
+        url.query_pairs_mut()
+            .append_pair("path", &omni_netproto::encode_path(path));
+        let response: HistoryResponse = json(self.auth(self.http.get(url)).send().await?).await?;
+        Ok(response.entries)
+    }
+
+    pub async fn resolve(
+        &self,
+        folder_id: &str,
+        path: &[u8],
+        restored_from: i64,
+    ) -> Result<SubmitOpsResponse, TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}/resolve"))?;
+        let request = self.auth(self.http.post(url)).json(&ResolveRequest {
+            path: omni_netproto::encode_path(path),
+            restored_from,
+        });
+        json(request.send().await?).await
     }
 
     /// Upload a chunk. `false` means the server already had it.

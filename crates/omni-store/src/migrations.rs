@@ -18,7 +18,10 @@ pub const MIGRATIONS: &[&str] = &[
 ];
 
 /// Client (agent) schema versions, in order.
-pub const AGENT_MIGRATIONS: &[&str] = &[include_str!("../migrations/agent_0001.sql")];
+pub const AGENT_MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/agent_0001.sql"),
+    include_str!("../migrations/agent_0002_holds.sql"),
+];
 
 /// Apply the server migrations that are newer than the recorded version.
 pub fn apply(conn: &mut Connection) -> Result<(), StoreError> {

@@ -12,23 +12,47 @@ use inquire::autocompletion::{Autocomplete, Replacement};
 use inquire::{Confirm, CustomUserError, Select, Text};
 use omni_netproto::FolderDto;
 
-/// Ask which server folder to watch. The list comes from the server.
-pub fn select_folder(folders: &[FolderDto]) -> Result<String> {
+/// What the user chose when picking a server folder in `omni-sync add`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FolderChoice {
+    Existing(String),
+    CreateNew(String),
+}
+
+/// Ask which server folder to watch, or offer to create a new one.
+pub fn select_or_create_folder(folders: &[FolderDto]) -> Result<FolderChoice> {
+    const CREATE_ITEM: &str = "+ Create a new folder…";
+
     if folders.is_empty() {
-        bail!("the server has no folders yet — create one on the dashboard first");
+        let name = prompt("No folders on the server yet — new folder name", None)?;
+        if name.is_empty() {
+            bail!("a folder name is required");
+        }
+        return Ok(FolderChoice::CreateNew(name));
     }
-    let items: Vec<String> = folders
+
+    let mut items: Vec<String> = folders
         .iter()
         .map(|folder| format!("{}  ({})", folder.name, folder.id))
         .collect();
+    items.push(CREATE_ITEM.to_string());
+
     let choice = Select::new("Which folder do you want to watch?", items)
         .with_help_message("↑/↓ to move, enter to pick")
         .prompt()?;
+    if choice == CREATE_ITEM {
+        let name = prompt("New folder name", None)?;
+        if name.is_empty() {
+            bail!("a folder name is required");
+        }
+        return Ok(FolderChoice::CreateNew(name));
+    }
+
     // The id is the parenthesised tail.
     folders
         .iter()
         .find(|folder| choice.ends_with(&format!("({})", folder.id)))
-        .map(|folder| folder.id.clone())
+        .map(|folder| FolderChoice::Existing(folder.id.clone()))
         .ok_or_else(|| anyhow!("could not match the selection to a folder"))
 }
 

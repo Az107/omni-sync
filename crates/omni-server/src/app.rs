@@ -16,9 +16,10 @@ use tokio::sync::broadcast;
 use omni_core::{Op, OpKind};
 use omni_netproto::{
     AppliedOpDto, ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
-    FoldersResponse, HealthResponse, LogEntryDto, ManifestEntryDto, ManifestResponse, MemberDto,
-    MembersResponse, OpKindDto, OpsResponse, OverwriteDto, PROTOCOL_VERSION, RegisterMemberRequest,
-    ResolveRequest, SubmitOpsRequest, SubmitOpsResponse,
+    FoldersResponse, HealthResponse, HistoryEntryDto, HistoryResponse, LogEntryDto,
+    ManifestEntryDto, ManifestResponse, MemberDto, MembersResponse, OpKindDto, OpsResponse,
+    OverwriteDto, PROTOCOL_VERSION, RegisterMemberRequest, ResolveRequest, SubmitOpsRequest,
+    SubmitOpsResponse,
 };
 use omni_store::sync::{self, ActiveFile, LogEntry, OverwriteRow};
 use omni_store::{StoreError, devices, folders, members, pairing};
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/folders", get(folders_page).post(folders_create))
         .route("/overwrites", get(overwrites_page))
         .route("/overwrites/{id}/resolve", post(overwrite_resolve))
+        .route("/overwrites/{id}/dismiss", post(overwrite_dismiss))
         // Device enrollment.
         .route("/api/v1/devices/enroll", post(enroll))
         // Folders.
@@ -65,6 +67,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/folders/{id}/ops", post(submit_ops).get(list_ops))
         .route("/api/v1/folders/{id}/ops/stream", get(stream_ops))
+        .route("/api/v1/folders/{id}/history", get(history))
         .route("/api/v1/folders/{id}/resolve", post(resolve))
         .route("/api/v1/overwrites", get(list_overwrites))
         // Chunks.
@@ -409,6 +412,21 @@ async fn overwrite_resolve(
     Ok(Redirect::to("/overwrites").into_response())
 }
 
+async fn overwrite_dismiss(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    state
+        .store
+        .blocking(move |conn| sync::mark_overwrite_resolved(conn, id))
+        .await?;
+    Ok(Redirect::to("/overwrites").into_response())
+}
+
 async fn login_form(headers: HeaderMap) -> Result<Html<String>, AppError> {
     Ok(Html(login_page(None, "/", &headers)?))
 }
@@ -679,10 +697,14 @@ async fn register_member(
     let member = state
         .store
         .blocking(move |conn| {
+            if !folders::exists(conn, &folder)? {
+                return Ok(None);
+            }
             members::upsert(conn, &folder, &device_id, &root_path, &mode)?;
-            members::list(conn, &folder)
+            Ok(Some(members::list(conn, &folder)?))
         })
         .await?
+        .ok_or(AppError::NotFound)?
         .into_iter()
         .find(|member| member.device_id == device.id)
         .ok_or_else(|| AppError::Internal("member vanished after upsert".into()))?;
@@ -857,13 +879,51 @@ async fn list_ops(
 async fn list_overwrites(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<SinceQuery>,
 ) -> Result<Json<Vec<OverwriteDto>>, AppError> {
     let _device = authenticate(&state, &headers).await?;
+    let since = query.since;
     let rows = state
         .store
-        .blocking(|conn| sync::overwrites(conn, true))
+        .blocking(move |conn| sync::overwrites_since(conn, true, since))
         .await?;
     Ok(Json(rows.into_iter().map(overwrite_dto).collect()))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    path: String,
+}
+
+async fn history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryResponse>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    let path = omni_netproto::decode_path(&query.path).unwrap_or_else(|_| query.path.into_bytes());
+    let entries = state
+        .store
+        .blocking(move |conn| sync::history(conn, &folder_id, &path))
+        .await?;
+    Ok(Json(HistoryResponse {
+        entries: entries
+            .into_iter()
+            .map(|entry| HistoryEntryDto {
+                version_id: entry.version_id,
+                seq: entry.seq,
+                device_id: entry.device_id,
+                base_version_id: entry.base_version_id,
+                size: entry.size,
+                mtime_ns: entry.mtime_ns,
+                mode: entry.mode,
+                restored_from: entry.restored_from,
+                created_at: entry.created_at,
+                active: entry.active,
+            })
+            .collect(),
+    }))
 }
 
 async fn resolve(
@@ -891,6 +951,7 @@ async fn resolve(
         .await?;
 
     // Restore the content under the requested path.
+    let resolved_path = path.clone();
     let op = Op {
         base_seq: 0,
         base_version_id: active,
@@ -904,6 +965,11 @@ async fn resolve(
         restored_from: Some(version.id),
     };
     let applied = state.apply(&folder_id, &device.id, op).await?;
+    let folder = folder_id.clone();
+    state
+        .store
+        .blocking(move |conn| sync::mark_path_overwrites_resolved(conn, &folder, &resolved_path))
+        .await?;
     state.publish_ops(&folder_id);
     Ok(Json(SubmitOpsResponse {
         applied: vec![AppliedOpDto {
@@ -1099,6 +1165,10 @@ async fn device_views(state: &AppState) -> Result<Vec<DeviceView>, AppError> {
 }
 
 /// The single sentence the overview leads with. Pure, so it is unit-tested.
+///
+/// Lag (`behind > 0`) means devices have not converged yet and takes precedence.
+/// Overwrites are last-write-wins history (both versions are kept for rollback),
+/// so once every device has caught up they do not raise a fault banner.
 fn status_summary(
     overwrites: i64,
     behind: i64,
@@ -1106,18 +1176,11 @@ fn status_summary(
     folders: i64,
     devices_total: i64,
 ) -> (String, String, String) {
-    if overwrites > 0 {
-        (
-            "bad".to_string(),
-            format!("{} to review", count(overwrites, "overwrite")),
-            "Two devices changed the same file while apart. Keep one; the other stays stored."
-                .to_string(),
-        )
-    } else if behind > 0 {
+    if behind > 0 {
         (
             "warn".to_string(),
             format!("{} behind", count(behind, "device")),
-            "A device is behind on a folder's change log. It catches up on the next poll."
+            "A device is behind on a folder's change log. It catches up on the next sync."
                 .to_string(),
         )
     } else if devices_total == 0 {
@@ -1125,6 +1188,17 @@ fn status_summary(
             "idle".to_string(),
             "Nothing is syncing yet".to_string(),
             "Add a device, then run `omni-sync add` to choose a folder.".to_string(),
+        )
+    } else if overwrites > 0 {
+        (
+            "ok".to_string(),
+            "All clear".to_string(),
+            format!(
+                "{}, {} — {} kept for rollback",
+                count(online, "device"),
+                count(folders, "folder"),
+                count(overwrites, "superseded version")
+            ),
         )
     } else {
         (
@@ -1303,14 +1377,18 @@ mod tests {
 
     #[test]
     fn the_overview_leads_with_the_most_urgent_state() {
-        // Overwrites outrank lag.
+        // Lag (genuine divergence) outranks converged overwrites.
         let (kind, head, _) = status_summary(1, 3, 2, 1, 2);
-        assert_eq!(kind, "bad");
-        assert_eq!(head, "1 overwrite to review");
-        // Lag next.
-        let (kind, head, _) = status_summary(0, 2, 2, 1, 2);
         assert_eq!(kind, "warn");
-        assert_eq!(head, "2 devices behind");
+        assert_eq!(head, "3 devices behind");
+        // Converged overwrites are calm rollback history, not a fault.
+        let (kind, head, sub) = status_summary(1, 0, 2, 1, 2);
+        assert_eq!(kind, "ok");
+        assert_eq!(head, "All clear");
+        assert_eq!(
+            sub,
+            "2 devices, 1 folder — 1 superseded version kept for rollback"
+        );
         // Nothing enrolled.
         let (kind, _, _) = status_summary(0, 0, 0, 0, 0);
         assert_eq!(kind, "idle");

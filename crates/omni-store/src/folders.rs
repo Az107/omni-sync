@@ -1,6 +1,6 @@
 //! Folder registry and device membership.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::StoreError;
 
@@ -26,6 +26,15 @@ pub fn create(conn: &Connection, folder: &Folder) -> Result<(), StoreError> {
         ],
     )?;
     Ok(())
+}
+
+pub fn exists(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    let found: Option<i64> = conn
+        .query_row("SELECT 1 FROM folders WHERE id = ?1", [id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(found.is_some())
 }
 
 pub fn list(conn: &Connection) -> Result<Vec<Folder>, StoreError> {

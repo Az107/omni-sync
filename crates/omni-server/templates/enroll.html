@@ -23,15 +23,15 @@
 
     {% if let Some(code) = code %}
       <section class="notice" aria-label="Pairing code">
-        <p class="notice-head">Pairing code {{ code }}</p>
-        <p>Valid for 10 minutes and usable once. It is already in this page's address, so the command below needs nothing else.</p>
+        <p class="notice-head">Pairing code: <code>{{ code }}</code></p>
+        <p>Valid for 10 minutes and usable once. Pass this code to <code>omni-sync enroll</code> below.</p>
       </section>
     {% else %}
       <section class="banner banner-bad" aria-label="No pairing code">
         <span class="dot dot-bad" aria-hidden="true"></span>
         <div>
-          <p class="banner-head">This link has no code</p>
-          <p class="banner-sub">Open Devices, choose “Add a device”, and use the link it gives you.</p>
+          <p class="banner-head">No pairing code</p>
+          <p class="banner-sub">Open Devices in the dashboard and choose “Add a device” to mint a pairing code.</p>
         </div>
       </section>
     {% endif %}
@@ -45,14 +45,12 @@
 
       <section class="step">
         <h2><span class="step-num" aria-hidden="true">2</span>Enroll this computer</h2>
-        {% if code.is_some() %}
-          <p>Copy this page's address from the browser bar, then run:</p>
-          <pre class="cmd">omni-sync enroll --link '&lt;this page's URL&gt;'</pre>
-          <p>Or by hand, using the server URL and the code above:</p>
-          <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code &lt;code above&gt;</pre>
+        {% if let Some(code) = code %}
+          <p>Run this command with your server URL and the pairing code above:</p>
+          <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code {{ code }}</pre>
         {% else %}
-          <p>Once you have a link with a code, run:</p>
-          <pre class="cmd">omni-sync enroll --link '&lt;the link from the dashboard&gt;'</pre>
+          <p>Once you have a pairing code from the dashboard, run:</p>
+          <pre class="cmd">omni-sync enroll --server &lt;server-url&gt; --code &lt;code&gt;</pre>
         {% endif %}
       </section>
 

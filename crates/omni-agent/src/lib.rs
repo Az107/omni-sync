@@ -11,9 +11,10 @@ mod policy;
 mod scan;
 mod watcher;
 
-pub use engine::{Engine, EngineConfig};
-pub use hold::{HeldReason, held};
+pub use engine::{Engine, EngineConfig, FlushRequest};
+pub use hold::{HeldReason, check_file, check_processes, held};
 pub use policy::{HoldRule, SyncMode};
+pub use scan::{path_bytes, path_from_bytes};
 pub use watcher::{WatchHandle, watch};
 
 /// The default content-defined chunker configuration for this device.

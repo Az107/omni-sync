@@ -110,6 +110,28 @@ pub struct ResolveRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntryDto {
+    pub version_id: i64,
+    pub seq: i64,
+    pub device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version_id: Option<i64>,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restored_from: Option<i64>,
+    pub created_at: String,
+    #[serde(default)]
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryResponse {
+    pub entries: Vec<HistoryEntryDto>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverwriteDto {
     pub path: String,
     pub losing_version_id: i64,

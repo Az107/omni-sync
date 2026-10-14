@@ -2,12 +2,45 @@
 //! defer a folder while a game (or anything else) is running.
 
 /// How a folder reacts to a change.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SyncMode {
     /// Hash and push on any change, debounced. Obsidian vaults.
+    #[default]
     Live,
     /// Hold a changed file until no process has it open. Game saves.
     OnClose,
+}
+
+impl SyncMode {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "live" => Some(Self::Live),
+            "on_close" | "on-close" => Some(Self::OnClose),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::OnClose => "on_close",
+        }
+    }
+}
+
+impl std::fmt::Display for SyncMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SyncMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+            .ok_or_else(|| format!("unknown sync mode '{s}' (expected 'live' or 'on_close')"))
+    }
 }
 
 /// Folder-level holds that defer both uploads and applies.

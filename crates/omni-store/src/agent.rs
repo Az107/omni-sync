@@ -52,12 +52,12 @@ pub fn set_file(
     let chunks_json =
         serde_json::to_string(&meta.chunks).map_err(|e| StoreError::Json(e.to_string()))?;
     conn.execute(
-        "INSERT INTO file_state (folder_id, path, size, mtime_ns, mode, chunks_json, version_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO file_state (folder_id, path, size, mtime_ns, mode, chunks_json, version_id, held_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)
          ON CONFLICT (folder_id, path) DO UPDATE
             SET size = excluded.size, mtime_ns = excluded.mtime_ns,
                 mode = excluded.mode, chunks_json = excluded.chunks_json,
-                version_id = excluded.version_id",
+                version_id = excluded.version_id, held_reason = NULL",
         params![
             folder_id,
             path,
@@ -67,6 +67,10 @@ pub fn set_file(
             chunks_json,
             version_id
         ],
+    )?;
+    conn.execute(
+        "DELETE FROM held_files WHERE folder_id = ?1 AND path = ?2",
+        params![folder_id, path],
     )?;
     Ok(())
 }
@@ -94,7 +98,77 @@ pub fn remove_file(conn: &Connection, folder_id: &str, path: &[u8]) -> Result<()
         "DELETE FROM file_state WHERE folder_id = ?1 AND path = ?2",
         params![folder_id, path],
     )?;
+    conn.execute(
+        "DELETE FROM held_files WHERE folder_id = ?1 AND path = ?2",
+        params![folder_id, path],
+    )?;
     Ok(())
+}
+
+/// Record or clear why a path is held (`held_by_pid:1234`, `process:retroarch`,
+/// `quiet_until`).
+pub fn set_held(
+    conn: &Connection,
+    folder_id: &str,
+    path: &[u8],
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    match reason {
+        Some(reason) => {
+            conn.execute(
+                "INSERT INTO held_files (folder_id, path, held_reason)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (folder_id, path) DO UPDATE
+                    SET held_reason = excluded.held_reason",
+                params![folder_id, path, reason],
+            )?;
+            conn.execute(
+                "UPDATE file_state SET held_reason = ?3
+                  WHERE folder_id = ?1 AND path = ?2",
+                params![folder_id, path, reason],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM held_files WHERE folder_id = ?1 AND path = ?2",
+                params![folder_id, path],
+            )?;
+            conn.execute(
+                "UPDATE file_state SET held_reason = NULL
+                  WHERE folder_id = ?1 AND path = ?2",
+                params![folder_id, path],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Clear every hold recorded for a folder.
+pub fn clear_held_folder(conn: &Connection, folder_id: &str) -> Result<(), StoreError> {
+    conn.execute("DELETE FROM held_files WHERE folder_id = ?1", [folder_id])?;
+    conn.execute(
+        "UPDATE file_state SET held_reason = NULL WHERE folder_id = ?1",
+        [folder_id],
+    )?;
+    Ok(())
+}
+
+/// Every currently held path in a folder, mapped to its `held_reason`.
+pub fn held_files(
+    conn: &Connection,
+    folder_id: &str,
+) -> Result<std::collections::BTreeMap<PathBytes, String>, StoreError> {
+    let mut stmt = conn
+        .prepare("SELECT path, held_reason FROM held_files WHERE folder_id = ?1 ORDER BY path")?;
+    let rows = stmt.query_map([folder_id], |row| {
+        Ok((row.get::<_, PathBytes>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut out = std::collections::BTreeMap::new();
+    for row in rows {
+        let (path, reason) = row?;
+        out.insert(path, reason);
+    }
+    Ok(out)
 }
 
 /// The highest op id this device has applied for a folder.
@@ -177,5 +251,27 @@ mod tests {
         assert_eq!(store.with(|conn| applied_seq(conn, "f1")).unwrap(), 12);
         store.with(|conn| set_applied_seq(conn, "f1", 20)).unwrap();
         assert_eq!(store.with(|conn| applied_seq(conn, "f1")).unwrap(), 20);
+    }
+
+    #[test]
+    fn held_paths_are_recorded_and_cleared_on_sync() {
+        let store = Store::open_agent_in_memory().unwrap();
+        let path = b"save.dat".as_slice();
+        store
+            .with(|conn| set_held(conn, "f1", path, Some("held_by_pid:4123")))
+            .unwrap();
+        let held = store.with(|conn| held_files(conn, "f1")).unwrap();
+        assert_eq!(held.get(path).map(String::as_str), Some("held_by_pid:4123"));
+
+        // Once the file syncs, its hold is cleared automatically.
+        store
+            .with(|conn| set_file(conn, "f1", path, &meta(vec![ChunkRef::new("aa", 3)]), 1))
+            .unwrap();
+        assert!(
+            store
+                .with(|conn| held_files(conn, "f1"))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -7,14 +7,14 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">Overwrites</h1>
-        <p class="page-note">Two devices changed the same file while apart. The newer version is active; the other is still stored, and restoring it brings every device in line.</p>
+        <p class="page-note">When two devices edit the same file while apart, the newer version becomes active automatically and the superseded version is kept here so you can roll back at any time.</p>
       </div>
     </div>
 
     {% if rows.is_empty() %}
       <div class="empty">
-        <strong>Nothing to review</strong>
-        Overwrites appear here only when two devices edit the same path while they are not in sync.
+        <strong>No superseded versions</strong>
+        When two devices edit the same path while apart, both versions are preserved here for rollback.
       </div>
     {% else %}
       {% for row in rows %}
@@ -34,10 +34,13 @@
                 <dt>size</dt><dd>{{ row.winning.size }}</dd>
                 <dt>version</dt><dd>{{ row.winning.version_id }}</dd>
               </dl>
+              <form method="post" action="/overwrites/{{ row.id }}/dismiss">
+                <button class="btn" type="submit">Keep active version</button>
+              </form>
             </div>
             <div class="compare-col">
               <span class="state">
-                <span class="dot dot-idle" aria-hidden="true"></span>Superseded
+                <span class="dot dot-idle" aria-hidden="true"></span>Superseded (kept for rollback)
               </span>
               <dl class="facts">
                 <dt>device</dt><dd>{{ row.losing.device }}</dd>

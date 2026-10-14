@@ -66,6 +66,21 @@ pub struct StoredVersion {
     pub chunks: Vec<ChunkRef>,
 }
 
+/// One row of a path's version history.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub version_id: i64,
+    pub seq: i64,
+    pub device_id: String,
+    pub base_version_id: Option<i64>,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub mode: u32,
+    pub restored_from: Option<i64>,
+    pub created_at: String,
+    pub active: bool,
+}
+
 /// An overwrite review row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OverwriteRow {
@@ -395,7 +410,7 @@ pub fn overwrite(conn: &Connection, id: i64) -> Result<Option<OverwriteRow>, Sto
     .map_err(StoreError::from)
 }
 
-/// Mark an overwrite review row resolved (after a restore).
+/// Mark an overwrite review row resolved (after a restore or dismiss).
 pub fn mark_overwrite_resolved(conn: &Connection, id: i64) -> Result<(), StoreError> {
     conn.execute(
         "UPDATE overwrites
@@ -406,17 +421,78 @@ pub fn mark_overwrite_resolved(conn: &Connection, id: i64) -> Result<(), StoreEr
     Ok(())
 }
 
+/// Mark every open overwrite row for `(folder_id, path)` resolved.
+pub fn mark_path_overwrites_resolved(
+    conn: &Connection,
+    folder_id: &str,
+    path: &[u8],
+) -> Result<(), StoreError> {
+    conn.execute(
+        "UPDATE overwrites
+            SET resolved_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+          WHERE folder_id = ?1 AND path = ?2 AND resolved_at IS NULL",
+        params![folder_id, path],
+    )?;
+    Ok(())
+}
+
+/// The version chain for one path in a folder, newest first.
+pub fn history(
+    conn: &Connection,
+    folder_id: &str,
+    path: &[u8],
+) -> Result<Vec<HistoryEntry>, StoreError> {
+    let active = active_version_id(conn, folder_id, path)?;
+    let mut stmt = conn.prepare(
+        "SELECT v.id, v.seq, COALESCE(d.name, v.device_id), v.base_version_id,
+                v.size, v.mtime_ns, v.mode, v.restored_from, v.created_at
+           FROM versions v
+           LEFT JOIN devices d ON d.id = v.device_id
+          WHERE v.folder_id = ?1 AND v.path = ?2
+          ORDER BY v.id DESC",
+    )?;
+    let rows = stmt.query_map(params![folder_id, path], |row| {
+        let version_id: i64 = row.get(0)?;
+        Ok(HistoryEntry {
+            version_id,
+            seq: row.get(1)?,
+            device_id: row.get(2)?,
+            base_version_id: row.get(3)?,
+            size: row.get::<_, i64>(4)? as u64,
+            mtime_ns: row.get(5)?,
+            mode: row.get(6)?,
+            restored_from: row.get(7)?,
+            created_at: row.get(8)?,
+            active: active == Some(version_id),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// The overwrite review queue, newest first.
 pub fn overwrites(conn: &Connection, open_only: bool) -> Result<Vec<OverwriteRow>, StoreError> {
+    overwrites_since(conn, open_only, 0)
+}
+
+/// The overwrite review queue with `id > since`, newest first.
+pub fn overwrites_since(
+    conn: &Connection,
+    open_only: bool,
+    since: i64,
+) -> Result<Vec<OverwriteRow>, StoreError> {
     let sql = if open_only {
         "SELECT id, folder_id, path, losing_version_id, winning_version_id, resolved_at
-           FROM overwrites WHERE resolved_at IS NULL ORDER BY id DESC"
+           FROM overwrites WHERE resolved_at IS NULL AND id > ?1 ORDER BY id DESC"
     } else {
         "SELECT id, folder_id, path, losing_version_id, winning_version_id, resolved_at
-           FROM overwrites ORDER BY id DESC"
+           FROM overwrites WHERE id > ?1 ORDER BY id DESC"
     };
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map([since], |row| {
         Ok(OverwriteRow {
             id: row.get(0)?,
             folder_id: row.get(1)?,

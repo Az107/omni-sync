@@ -7,7 +7,7 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">Devices</h1>
-        <p class="page-note">Every device holds a token and syncs the folders it declares. Add one with a pairing link.</p>
+        <p class="page-note">Every device holds a token and syncs the folders it declares. Add one with a one-time pairing code.</p>
       </div>
       <form method="post" action="/devices/pair">
         <button class="btn btn-primary" type="submit">Add a device</button>
@@ -15,16 +15,15 @@
     </div>
 
     {% if let Some(code) = code %}
-      <section class="notice" aria-label="New pairing link">
-        <p class="notice-head">Pairing link ready</p>
-        <p>Open this address on the new machine, or copy it into <code>omni-sync enroll --link</code>. Valid for 10 minutes, usable once.</p>
-        <pre class="cmd" id="magic-url"></pre>
-        <p class="page-note">By hand: <code>omni-sync enroll --server &lt;server-url&gt; --code {{ code }}</code></p>
+      <section class="notice" aria-label="New pairing code">
+        <p class="notice-head">Pairing code: <code>{{ code }}</code></p>
+        <p>Valid for 10 minutes, usable once. Run this command on the new machine:</p>
+        <pre class="cmd" id="enroll-cmd">omni-sync enroll --server &lt;server-url&gt; --code {{ code }}</pre>
         <script>
           (function () {
-            var base = location.origin + location.pathname.replace(/devices\/?$/, "");
-            var url = base + "enroll?code={{ code }}";
-            document.getElementById("magic-url").textContent = url;
+            var base = location.origin + location.pathname.replace(/\/devices\/?$/, "");
+            document.getElementById("enroll-cmd").textContent =
+              "omni-sync enroll --server " + base + " --code {{ code }}";
           })();
         </script>
       </section>
@@ -34,7 +33,7 @@
       {% if devices.is_empty() %}
         <div class="empty">
           <strong>No devices yet</strong>
-          Choose “Add a device” to mint a pairing link, then run the command it shows on the new machine.
+          Choose “Add a device” to mint a pairing code, then run <code>omni-sync enroll</code> on the new machine.
         </div>
       {% else %}
         <ul class="rows">

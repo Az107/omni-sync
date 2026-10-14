@@ -18,44 +18,43 @@ One Rust workspace, several crates, two binaries.
 
 ## Status
 
-**M0–M4 are done; the MVP syncs and is manageable.** A server and two
-client daemons were run against each other and the following held: a
-create (including a binary file, byte-identical on both sides), an edit
-propagating both ways within ~2 s, a delete propagating, and an offline
-edit on both devices producing exactly one overwrite row with
-last-write-wins converging both devices on the same content. The
-dashboard was then used to *restore older* on that overwrite, and both
-devices converged on the superseded content with the queue cleared. 47
-tests, clippy clean.
+**M0–M4 and M6 are done, plus the client lifecycle, sync modes (`live` /
+`on_close`), and CLI history/resolve/flush commands.** A server and two
+client daemons were run against each other and verified for: create
+(including binary files, byte-identical on both sides), bidirectional
+edits within ~2 s, deletes, adding a new folder while daemons are already
+running (live config reload + control handoff), `on_close` holding an open
+file with `held_by_pid:<pid>` until the descriptor closes, offline edits on
+both devices producing one overwrite row with last-write-wins convergence,
+and rolling back a file via both the dashboard and `omni-sync resolve`.
+91 unit tests, clippy `-D warnings` clean.
 
-What exists: the whole pure core (`omni-core`, `omni-chunk`), the wire
-contract, both SQLite schemas, the server with its `/api/v1` surface,
-chunk store and dashboard (overview, devices + pairing codes, folders,
-overwrites + resolve), and the client engine (`omni-agent::Engine`) that
-scans, pushes ops+chunks and applies the pulled log.
+What exists:
 
-**M5 (hardening) is not built.** `history`, `resolve` and `flush` client
-subcommands still print their milestone; there is no chunk GC and no
-per-folder membership enforcement. See "Known gaps".
-
-**M6 (onboarding + updates) is built.** The dashboard mints a magic link
-(`/enroll?code=…`); `omni-sync enroll --link '<link>'` binds a loopback
-listener and opens a browser so the server page hands the one-time code
-back to the client. `omni-sync add` with no arguments is a wizard that
-selects a server folder and completes a local path, then records
-membership on the server (the `members` table is now used). Both
-binaries have `update`, which picks the release asset for the
-compiled-in target, verifies it against the release's `SHA256SUMS`, and
-installs it atomically; releases publish bare binaries for that purpose.
+- Pure core (`omni-core`, `omni-chunk`), wire contract (`omni-netproto`),
+  and both SQLite schemas (`omni-store`: server + agent).
+- Server (`omni-server`) with `/api/v1` (enrollment, folders, members,
+  manifest, ops + SSE stream, per-path history, resolve, overwrites,
+  chunks) and the server-rendered dashboard (overview, devices + pairing
+  codes, folders + sync rails, overwrites with *Restore this version* and
+  *Keep active version*).
+- Client engine (`omni-agent`) with `notify` watcher, metadata-triage scan,
+  atomic apply, `live` and `on_close` policies, `/proc` holder and process
+  glob detection (`held_files` + `file_state.held_reason`), and SSE-woken
+  pull.
+- Client CLI (`omni-cli`) with `enroll`, `add` (validates/creates folders,
+  registers membership, triggers initial sync), `folder create|list`,
+  `daemon` (live config reload + loopback control socket), `flush` (alias
+  `sync`), `status` (including held files), `history`, `resolve`, `doctor`,
+  and `update`.
 
 **Change detection is event-driven at both ends.** Push runs on `notify`
-events (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan;
-pull is woken by the server's op-log SSE stream
+mutation events (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s
+safety scan; pull is woken by the server's op-log SSE stream
 (`GET /api/v1/folders/{id}/ops/stream`), with a 60 s fallback poll for a
 server that has no stream or a connection that died silently. Scanning
 reuses the last-synced chunk list for any file whose size/mtime/mode are
-unchanged, so an idle folder does no disk reads. Measured: ~1.6 s
-end-to-end propagation, ~5% of one core when idle.
+unchanged, so an idle folder does no disk reads.
 
 ## Commands
 
@@ -73,9 +72,14 @@ cargo run -p omni-server -- doctor
 
 # client
 cargo run -p omni-cli -- enroll --server http://127.0.0.1:8787 --code ABCD-EFGHJ
-cargo run -p omni-cli -- enroll --link 'http://127.0.0.1:8787/enroll?code=ABCD-EFGHJ'  # browser handoff
-cargo run -p omni-cli -- add            # wizard: pick a folder, complete a path
-cargo run -p omni-cli -- update --check # is a newer release out?
+cargo run -p omni-cli -- folder create Docs
+cargo run -p omni-cli -- add --create Docs ~/Docs   # or `add` with no args for the wizard
+cargo run -p omni-cli -- daemon
+cargo run -p omni-cli -- flush                      # sync now (alias: `sync`)
+cargo run -p omni-cli -- status
+cargo run -p omni-cli -- history Docs notes/todo.md
+cargo run -p omni-cli -- resolve Docs notes/todo.md --to 1
+cargo run -p omni-cli -- update --check             # is a newer release out?
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
@@ -108,30 +112,143 @@ targets are smoke-tested — `x86_64-apple-darwin` and
 `AWS_LC_SYS_PREBUILT_NASM=1` is set because the Windows image has no NASM
 and `aws-lc-sys` x64 builds need it (ignored off Windows x86-64).
 
-### M0 smoke test
+### Smoke test
 
-Self-contained; uses `/tmp` so it never touches real per-user dirs.
+Self-contained; uses `/tmp/opencode` so it never touches real per-user dirs.
 
 ```sh
-mkdir -p /tmp/omni-e2e && cat > /tmp/omni-e2e/server.toml <<'TOML'
+mkdir -p /tmp/opencode/omni-e2e && cat > /tmp/opencode/omni-e2e/server.toml <<'TOML'
 addr = "127.0.0.1:8799"
-data_dir = "/tmp/omni-e2e/data"
-state_dir = "/tmp/omni-e2e/state"
+data_dir = "/tmp/opencode/omni-e2e/data"
+state_dir = "/tmp/opencode/omni-e2e/state"
 dashboard_password_hash = ""
 TOML
 
-OMNI_SYNC_PASSWORD=smoke ./target/debug/omni-sync-server --config /tmp/omni-e2e/server.toml init
-./target/debug/omni-sync-server --config /tmp/omni-e2e/server.toml serve &
+OMNI_SYNC_PASSWORD=smoke ./target/debug/omni-sync-server --config /tmp/opencode/omni-e2e/server.toml init
+./target/debug/omni-sync-server --config /tmp/opencode/omni-e2e/server.toml serve &
 curl -s http://127.0.0.1:8799/healthz                     # {"ok":true,...}
-CODE=$(./target/debug/omni-sync-server --config /tmp/omni-e2e/server.toml pair | head -1)
-./target/debug/omni-sync --config /tmp/omni-e2e/client.toml \
+CODE=$(./target/debug/omni-sync-server --config /tmp/opencode/omni-e2e/server.toml pair | head -1)
+./target/debug/omni-sync --config /tmp/opencode/omni-e2e/client.toml \
   enroll --server http://127.0.0.1:8799 --code "$CODE" --name smoke
-./target/debug/omni-sync-server --config /tmp/omni-e2e/server.toml doctor   # devices: 1
+./target/debug/omni-sync-server --config /tmp/opencode/omni-e2e/server.toml doctor   # devices: 1
 ```
 
 What to check: `/` anonymously is `303` to `/login`; a login `POST`
 sets the cookie and the overview renders; enrolling with the same code
 twice returns `400 invalid, expired or already-used pairing code`.
+
+## Engine & Watcher Invariants (Traps That Break Sync)
+
+Read this section before touching `omni-agent` or `omni-cli::daemon`. Every
+rule below comes from a real bug that broke two-way sync or lost offline
+edits.
+
+1. **`watcher::watch` must filter out read-only `notify` events
+   (`EventKind::Access(Open | Read | Close(Read))`).**
+   - *Trap*: On Linux (`inotify`), `notify::recommended_watcher` subscribes
+     to `IN_OPEN` and `IN_CLOSE_NOWRITE` by default. Every time
+     `Engine::push_inner` runs `scan::scan`, `fs::read_dir` and `fs::read`
+     open directories and files under the watched root. If `watcher::watch`
+     forwards read-only access events, `scan::scan` queues a new event
+     *while `push_inner` is running* (after the debounce drain). In a
+     `biased` `tokio::select!`, `events.recv()` is then immediately ready on
+     the next loop iteration, locking the engine into an infinite 250 ms
+     self-scan loop and **starving `wake.recv()` (the pull stream) forever**.
+   - *Rule*: `watcher::is_relevant` only forwards `Create`, `Modify`,
+     `Remove`, `Any`, and `Access(Close(Write))`, and drops events whose
+     paths are all ignored temp files (`.omni-tmp`). In
+     `Engine::run_with_control`, `wake.recv()` also sits above
+     `events.recv()` in the `biased` `select!`.
+
+2. **First sync (`applied_seq == 0`) pulls before pushing; initialized sync
+   (`applied_seq > 0`) pushes before pulling (`Engine::sync_step`).**
+   - *Trap A (pushing first when `applied_seq == 0`)*: When a device joins a
+     folder that already has files on the server and already has a copy of
+     those files on disk, pushing before pulling sends every file with
+     `base_version_id = None` (since `file_state` is empty), turning the
+     entire directory into false overwrite rows.
+   - *Trap B (pulling first when `applied_seq > 0`)*: When an already-synced
+     device (`applied_seq > 0`) edits a file while offline and reconnects,
+     pulling unconditionally before pushing downloads the remote version and
+     calls `apply::write_file` + `agent::set_file` over the local file
+     *before* `push_inner` ever scans it — silently wiping out the user's
+     offline edit without creating an overwrite row.
+   - *Trap C (pre-existing local files on first sync)*: During first sync
+     (`!versions.contains_key(&path)`), if `pull_inner` sees `disk_path`
+     already exists locally, it hashes the local file first:
+     - if `local_meta.equivalent(&remote_meta)` (same chunks + mode), it
+       records `entry.version_id` in `file_state` without rewriting;
+     - if the local content differs, it leaves the local file intact on disk
+       and records a synthetic baseline (`mtime_ns = 0`, `version_id = 0`)
+       in `file_state` so the immediately following `push_inner` uploads the
+       local file and records an overwrite on the server (keeping both
+       versions).
+
+3. **`ops.id` is one global sequence across ALL folders — `push_inner` must
+   reconcile `pull_inner` after pushing, and `pull_inner` must skip
+   re-downloading its own `version_id`.**
+   - *Trap*: `ops.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` on a single
+     table shared by all folders. Pushing to Folder A advances `ops.id`,
+     creating a sequence gap in Folder B. `advance_watermark` (rightly)
+     advances `applied_seq` only across contiguous sequence numbers starting
+     at `previous`, because a gap *might* contain a foreign op in the same
+     folder. Without an immediate follow-up `pull_inner` after `submit_ops`:
+     - `applied_seq` on the client and `members.acked_seq` on the server
+       (which is updated by `GET /ops`) remain stuck behind the device's own
+       push, so the dashboard sync rail shows the pushing device as "behind";
+     - and when `pull_inner` later tails `ops?since=<old>`, the server
+       returns the device's own just-pushed ops. If `pull_inner` does not
+       check `versions.get(&path) == Some(&entry.version_id) &&
+       disk_path.exists()`, it re-downloads the chunks it just uploaded and
+       rewrites the file on disk.
+   - *Rule*: Keep `advance_watermark` strict (contiguous run from
+     `previous`), call `pull_inner` at the end of `push_inner` whenever ops
+     were submitted, and in `pull_inner` short-circuit (advance
+     `applied_seq` without `fetch_chunks`/`write_file`) when
+     `versions.get(&path) == Some(&entry.version_id)` and the file exists on
+     disk. (Every `Put` or `Resolve` on the server mints a strictly new
+     `versions.id`, so equality means this client already has that exact
+     version.)
+
+4. **Never run a second `Engine` concurrently with `omni-sync daemon` on the
+   same `agent.db`.**
+   - *Trap*: Running `omni-sync flush` or `omni-sync add`'s initial sync by
+     opening a second `Engine` in the CLI process while `daemon` is already
+     watching the same config causes two processes to race on `file_state`,
+     `applied_seq`, and `.omni-tmp` renames.
+   - *Rule*: `daemon::run` binds an authenticated loopback listener
+     (`127.0.0.1:0`, credentials written to `<stem>.daemon.ctl` with mode
+     `0600`) and hands each folder's `Engine::run_with_control` a channel of
+     `FlushRequest`s. `add`, `flush` (`sync`), and `resolve` call
+     `daemon::try_send_command` first so the running `Engine` executes the
+     sync inside its own `select!` loop; only when no daemon is running does
+     the CLI run a one-shot `Engine` in-process.
+
+5. **`spawn_op_waker` must select on `wake.closed()`.**
+   - *Trap*: When `daemon` removes or reconfigures a folder, it aborts the
+     `Engine` task, dropping the `mpsc::Receiver<()>`. If `spawn_op_waker`
+     only ignores `wake.try_send(())` errors, the background SSE task never
+     notices the receiver is gone and reconnects to `/ops/stream` forever.
+   - *Rule*: Every await point inside `spawn_op_waker` (`stream_ops`,
+     `next_head`, and the backoff sleep) must be wrapped in
+     `tokio::select! { _ = wake.closed() => return, ... }`.
+
+6. **Config saves (`write_private`) must be atomic (write-temp-then-rename),
+   and config watching must watch the parent directory.**
+   - *Trap*: Truncating `client.toml` in place lets the daemon's watcher read
+     a half-written or empty TOML file. Conversely, atomic rename replaces
+     the file's inode, which causes a single-file `inotify` watch to stop
+     firing after the first save.
+   - *Rule*: `write_private` writes `<file>.tmp.<pid>` (`0600`), calls
+     `sync_all()`, and renames over `<file>`. `daemon::watch_config_dir`
+     watches `config_path.parent()` non-recursively (filtering to mutation
+     events on `config_path.file_name()`) plus a 1 s content check fallback.
+
+7. **Tracing logs must go to `stderr` (`.with_writer(std::io::stderr)`).**
+   - *Trap*: `tracing_subscriber::fmt()` defaults to `stdout`. Subcommands
+     like `omni-sync-server pair` and `omni-sync folder create` print bare
+     codes/IDs to `stdout` for shell capture (`CODE=$(... pair | head -1)`).
+     Any log line on `stdout` (such as `applied migration`) corrupts scripts.
 
 ## Non-obvious structure
 
@@ -147,40 +264,27 @@ twice returns `400 invalid, expired or already-used pairing code`.
   Never round-trip a path through `String`/`to_string_lossy`.
 - **`omni-store` has three access shapes**: `blocking`/`blocking_mut`
   (async, `spawn_blocking`) and `with`/`with_mut` (sync, for CLI paths).
-  `*_mut` exists only for transactions — currently just pairing-code
-  consumption.
+  `*_mut` exists only for transactions.
 - **The server binds loopback.** TLS and the public hostname are
   Traefik's job; do not add a TLS listener here.
-- **The client DB is keyed by the config file's name** (`a.toml` →
-  `a.agent.db`), not just its directory. Two clients sharing one DB was a
-  real bug: they clobbered each other's `file_state` and every file
-  became a delete/overwrite storm.
-- **`omni-agent::Engine` pulls before it pushes, and records only what it
-  applied.** `run` does one pull before the loop, so a first sync sees what
-  the server already has instead of reporting a whole directory as an
-  overwrite. A push then sets `file_state` (with the returned
-  `version_id`) and advances `applied_seq` — but *only over ops it really
-  applied* (`advance_watermark`). Op ids are one global sequence, so a
-  foreign op can land inside our batch (we take 101, another device takes
-  102, we take 103); jumping the watermark to our last seq would skip 102
-  for good, which is what made a change from one device never reach
-  another. `base_version_id` comes from the per-path version map, and is
-  sent as `None` (not `0`) for a path that has never synced.
-- **Push and pull are both event-driven.** Push is `notify`-driven
-  (inotify/FSEvents/`ReadDirectoryChangesW`) with a 30 s safety scan,
-  because it must walk and hash the tree. Pull is woken by the server's
-  op-log SSE stream (`GET /api/v1/folders/{id}/ops/stream`), which fires
-  the moment a folder's op log grows; a 60 s fallback poll covers a server
-  without the stream and a connection that dies without the socket
-  noticing. The stream carries only the head seq — the ops still come from
-  `ops?since=`, so the diff has one implementation. Scanning reuses the
-  last-synced chunk list for files whose size/mtime/mode are unchanged, so
-  an idle folder does no disk reads. Inotify can drop events (queue
-  overflow, new directories, NFS), which is what the safety scan is for.
+- **The client DB and daemon control file are keyed by the config file's
+  stem** (`a.toml` → `a.agent.db`, `a.daemon.ctl`), not just its directory.
+  Two clients in one directory (as in tests) never share state.
 - **Apply does not restore mtime.** Content (the chunk list) and mode are
   what matter; restoring mtime needs `utimensat`/libc and is deferred. A
   `FileMeta` equality therefore includes mtime, but sync decisions use
-  `FileMeta::equivalent` (chunks + mode).
+  `FileMeta::equivalent` (chunks + mode), and `pull_inner` records the
+  on-disk `local_mtime_ns` after writing so the next scan's metadata fast
+  path matches.
+- **Sync modes (`live` vs `on_close`) and holds.** `EngineConfig` carries
+  `SyncMode` and `HoldRule` (`process_globs`, `quiet_timeout_secs`). In
+  `on_close` mode (or when `hold_while_process` matches a running process),
+  both outbound uploads and inbound overwrites of held files defer, and
+  `agent.db` records the reason in `held_files` and `file_state.held_reason`
+  (`held_by_pid:<pid>`, `process:<name>`, `quiet_until`). While holds exist,
+  `Engine::run_with_control` enables a 500 ms retry tick so releasing an fd
+  or exiting a process syncs within ~0.5 s; when no holds exist, the retry
+  tick is disabled.
 - **askama's `render()` is a trait method.** `use askama::Template as _;`
   must be in scope where you call it, not only where the struct is
   defined.
@@ -195,8 +299,10 @@ twice returns `400 invalid, expired or already-used pairing code`.
   against the folder's op-log head, so "behind" is literal. The server records
   a member's watermark on every pull (`GET /folders/{id}/ops` →
   `members::set_acked`); without that the rail would always read behind. The
-  overview leads with a status banner (`status_summary`, unit-tested) rather
-  than a row of metric cards.
+  overview leads with a status banner (`status_summary`, unit-tested): device
+  lag (`behind > 0`) raises `warn`, whereas converged overwrites (`behind ==
+  0`) keep the banner `ok` ("All clear") and note how many superseded
+  versions are kept for rollback.
 - **axum 0.8 catch-all routes are `{*path}`**, not `/*path`.
 - **`omni-update` derives the target triple from `build.rs`** (which
   re-emits the build script's `TARGET` as `OMNI_TARGET`). Asset selection
@@ -219,17 +325,17 @@ twice returns `400 invalid, expired or already-used pairing code`.
 - **The server is the only sequencer.** `omni_core::Sequencer::decide`
   is the single ordering rule; no device clock may order versions.
 - **Last-write-wins never deletes history.** A superseded version is kept
-  so the dashboard can roll back; retention is the only thing that
-  removes rows.
-- **Migrations are forward-only.** Append to `migrations::MIGRATIONS`;
-  never edit an applied script.
+  so the dashboard or `omni-sync resolve` can roll back; retention is the
+  only thing that removes rows.
+- **Migrations are forward-only.** Append to `migrations::MIGRATIONS` or
+  `migrations::AGENT_MIGRATIONS`; never edit an applied script.
 - **A chunk's hash is `sha256` of its bytes** and is verified on upload
   and after download. Nothing is stored under a hash it was not proven
   to match.
 - **The dashboard must never render bytes it does not understand.** When
-  previews land (M4): text → diff, images → inline (never SVG), all else
-  → metadata only, and every preview sets `X-Content-Type-Options:
-  nosniff` plus a tight CSP.
+  previews land: text → diff, images → inline (never SVG), all else →
+  metadata only, and every preview sets `X-Content-Type-Options: nosniff`
+  plus a tight CSP.
 
 ## Toolchain gotchas
 
@@ -289,28 +395,20 @@ deployment works unchanged.
 
 ## Known gaps (not bugs)
 
-- `history`, `resolve` and `flush` still print "not implemented yet". The
-  server-side `resolve` endpoint exists; only the client subcommands are
-  stubs.
 - **Move ops are refused** (`StoreError::Unsupported`); a rename is a
   delete + put at the client. The op kind exists in the schema.
 - **Per-folder membership is not enforced.** Any enrolled device may
-  read or write any folder. Membership is now *recorded* (`members`, via
+  read or write any folder. Membership is *recorded* (`members`, via
   `POST /api/v1/folders/{id}/members`) and shown on the dashboard, but
   the server does not check it on read or write.
-- The dashboard covers overview, devices (with pairing codes), folders
-  and overwrites (with *restore older*). It is plain form posts, no HTMX
-  yet, and there is no per-file history view.
 - **The metadata fast path trusts mtime.** A file edited in place with
   its timestamp preserved is not detected until its metadata changes.
   That is the deliberate triage rule; a full-content `omni verify` is the
   escape hatch and is not built yet.
 - **No chunk refcount GC.** `chunks.refs` is maintained on write; nothing
   reclaims unreferenced chunks yet.
-- **`omni_agent::held()` always returns `None`.** On-close/live modes are
-  modelled (`SyncMode`, `HoldRule`) but holder detection is not built.
 - The dashboard is plain form posts (no HTMX yet): overview, devices
-  with pairing codes, folders, and overwrites with *restore older*.
+  with pairing codes, folders, and overwrites with *restore* / *keep active*.
 - `omni-core`'s `Op`/`Version` and `omni-netproto`'s DTOs are deliberately
   separate types, bridged by `omni-netproto::convert`.
 
@@ -325,7 +423,9 @@ FOLDER=$(./target/debug/omni-sync-server --config $R/server.toml folder create D
 ```
 
 What to check: a file written in one dir appears byte-identical in the
-other within ~2 s; an edit propagates both ways; a delete propagates; and
-an offline edit on both sides leaves exactly one entry in
-`GET /api/v1/overwrites` with both devices converged on the same content.
-`RUST_LOG=info` makes the daemon print `pushed changes` per cycle.
+other within ~2 s; an edit propagates both ways; a delete propagates; adding
+a second folder via `omni-sync add --create` while both daemons are running
+syncs immediately without a restart; and an offline edit on both sides
+leaves one entry in `GET /api/v1/overwrites` with both devices converged on
+the same content. `RUST_LOG=info` makes the daemon print `pushed changes`
+per cycle.
