@@ -110,14 +110,15 @@ async fn update(
     download_only: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let binary = "omni-sync-server";
+    let version = env!("CARGO_PKG_VERSION");
     let target = omni_update::target();
-    let current = omni_update::current_version();
+    let current = omni_update::current_version(version);
     println!("current: {current} ({target})");
 
     let plan = if force {
-        Some(omni_update::plan(binary, target, to.as_deref()).await?)
+        Some(omni_update::plan(binary, version, target, to.as_deref()).await?)
     } else {
-        omni_update::check(binary, target, to.as_deref()).await?
+        omni_update::check(binary, version, target, to.as_deref()).await?
     };
 
     let Some(plan) = plan else {

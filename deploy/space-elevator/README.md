@@ -188,8 +188,12 @@ first deploy.
 client-only change (daemon service install + restart-on-update), so the wire
 contract is unchanged (`PROTOCOL_VERSION` is still 1) and the deployed server
 needs no redeploy. `healthz` therefore keeps reporting `0.4.0`, which is
-accurate — the `omni-sync-server-0.4.1-*` asset exists only for someone who
-later wants the version strings to line up.
+accurate.
+
+The client and server now version and release independently (`client-v*` /
+`server-v*` tags, see `AGENTS.md`). The `v0.4.1` release predates that split and
+still bundles a `omni-sync-server-0.4.1-*` asset; the server's own version is
+`0.4.0` in the manifest, and its next release will be tagged `server-v0.4.0`.
 
 - `GET /healthz` → `{"ok":true,"version":"0.4.0"}`
 - `GET /` → `303` to login; login renders the designed dashboard;

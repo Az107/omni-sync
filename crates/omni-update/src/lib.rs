@@ -2,9 +2,14 @@
 //!
 //! The release workflow publishes, per target, a bare binary named
 //! `omni-sync-<version>-<target>` (`.exe` on Windows) plus a `SHA256SUMS`
-//! file. This crate finds the newest release, picks the asset for the target
-//! this binary was built for, verifies it against `SHA256SUMS`, and installs
-//! it in place.
+//! file. This crate finds the newest release *for its own component*, picks the
+//! asset for the target this binary was built for, verifies it against
+//! `SHA256SUMS`, and installs it in place.
+//!
+//! The client and server release independently, so each has its own tag train —
+//! `client-v<version>` and `server-v<version>` — and [`release`] scans the
+//! release list for the newest tag matching the binary's prefix rather than
+//! following GitHub's repo-wide "latest".
 //!
 //! Trust is checksum-only: `SHA256SUMS` and the asset come from the same
 //! release, so this trusts whoever can publish a release. A signature
@@ -32,8 +37,32 @@ pub fn target() -> &'static str {
 }
 
 /// The version of the running binary.
-pub fn current_version() -> Version {
-    Version::parse(env!("CARGO_PKG_VERSION")).expect("CARGO_PKG_VERSION is written as semver")
+///
+/// The binary crate passes its *own* `CARGO_PKG_VERSION`; this cannot read that
+/// itself, because `env!` here would resolve to this library's version, and the
+/// client and server now version independently.
+pub fn current_version(version: &str) -> Version {
+    Version::parse(version).expect("a binary's CARGO_PKG_VERSION is written as semver")
+}
+
+/// The GitHub tag prefix that identifies `binary`'s release train.
+pub fn tag_prefix(binary: &str) -> &'static str {
+    if binary == "omni-sync-server" {
+        "server-v"
+    } else {
+        "client-v"
+    }
+}
+
+/// Parse a release tag into a version. `client-v0.4.1`, `server-v0.4.1` and a
+/// legacy `v0.4.1` all yield `0.4.1`.
+pub fn version_from_tag(tag: &str) -> Option<Version> {
+    let rest = tag
+        .strip_prefix("client-v")
+        .or_else(|| tag.strip_prefix("server-v"))
+        .or_else(|| tag.strip_prefix('v'))
+        .unwrap_or(tag);
+    Version::parse(rest).ok()
 }
 
 /// `(owner, repo)` parsed from the workspace's `repository` URL.
@@ -116,14 +145,43 @@ fn token_from_env() -> Option<String> {
         .filter(|token| !token.is_empty())
 }
 
-/// Fetch the newest release (`tag = None`) or a specific tag.
-pub async fn release(tag: Option<&str>) -> Result<Release, UpdateError> {
+/// Fetch the newest release for `binary`'s tag train (`tag = None`), or a
+/// specific tag.
+///
+/// GitHub's `/releases/latest` is repo-wide, so with two components this lists
+/// releases and keeps the newest tag that starts with the binary's prefix.
+pub async fn release(binary: &str, tag: Option<&str>) -> Result<Release, UpdateError> {
     let (owner, repo) = repository_parts();
-    let url = match tag {
-        Some(tag) => format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}"),
-        None => format!("https://api.github.com/repos/{owner}/{repo}/releases/latest"),
-    };
+    match tag {
+        Some(tag) => {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/releases/tags/{tag}");
+            parse_release(fetch_json(&url).await?)
+        }
+        None => {
+            let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
+            let list: Vec<ReleaseJson> = fetch_json(&url).await?;
+            let prefix = tag_prefix(binary);
+            let mut newest: Option<Release> = None;
+            for json in list {
+                if !json.tag_name.starts_with(prefix) {
+                    continue;
+                }
+                let Ok(candidate) = parse_release(json) else {
+                    continue;
+                };
+                if newest
+                    .as_ref()
+                    .is_none_or(|best| candidate.version > best.version)
+                {
+                    newest = Some(candidate);
+                }
+            }
+            newest.ok_or(UpdateError::NoRelease)
+        }
+    }
+}
 
+async fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, UpdateError> {
     let mut request = http()
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json");
@@ -141,9 +199,12 @@ pub async fn release(tag: Option<&str>) -> Result<Release, UpdateError> {
             body: response.text().await.unwrap_or_default(),
         });
     }
-    let json: ReleaseJson = response.json().await?;
-    let version = Version::parse(json.tag_name.trim_start_matches('v'))
-        .map_err(|_| UpdateError::Version(json.tag_name.clone()))?;
+    Ok(response.json().await?)
+}
+
+fn parse_release(json: ReleaseJson) -> Result<Release, UpdateError> {
+    let version = version_from_tag(&json.tag_name)
+        .ok_or_else(|| UpdateError::Version(json.tag_name.clone()))?;
     Ok(Release {
         tag: json.tag_name,
         version,
@@ -171,14 +232,16 @@ pub struct Plan {
 
 /// Find a newer release for `binary`, or `None` when already current.
 ///
-/// `target` overrides the compile-time target (for tests). `requested` pins a
-/// specific tag instead of `latest`.
+/// `version` is the running binary's own `CARGO_PKG_VERSION`. `target`
+/// overrides the compile-time target (for tests). `requested` pins a
+/// specific tag instead of the newest on the binary's tag train.
 pub async fn check(
     binary: &str,
+    version: &str,
     target: &str,
     requested: Option<&str>,
 ) -> Result<Option<Plan>, UpdateError> {
-    let plan = plan(binary, target, requested).await?;
+    let plan = plan(binary, version, target, requested).await?;
     if requested.is_none() && plan.release.version <= plan.current {
         return Ok(None);
     }
@@ -189,11 +252,12 @@ pub async fn check(
 /// is newer than the running binary — what `--force` re-installs.
 pub async fn plan(
     binary: &str,
+    version: &str,
     target: &str,
     requested: Option<&str>,
 ) -> Result<Plan, UpdateError> {
-    let current = current_version();
-    let release = release(requested).await?;
+    let current = current_version(version);
+    let release = release(binary, requested).await?;
     let name = asset_name(binary, &release.version.to_string(), target);
     let asset = release
         .assets
@@ -374,6 +438,35 @@ mod tests {
         let (owner, repo) = repository_parts();
         assert!(!owner.is_empty() && !repo.is_empty());
         assert!(!repo.ends_with(".git"));
+    }
+
+    #[test]
+    fn each_binary_has_its_own_tag_train() {
+        assert_eq!(tag_prefix("omni-sync"), "client-v");
+        assert_eq!(tag_prefix("omni-sync-server"), "server-v");
+    }
+
+    #[test]
+    fn tags_parse_to_versions_with_or_without_a_component_prefix() {
+        let parse = |tag: &str| version_from_tag(tag).map(|v| v.to_string());
+        assert_eq!(parse("client-v0.4.1").as_deref(), Some("0.4.1"));
+        assert_eq!(parse("server-v0.4.0").as_deref(), Some("0.4.0"));
+        // A legacy tag and a bare version still parse.
+        assert_eq!(parse("v0.4.1").as_deref(), Some("0.4.1"));
+        assert_eq!(parse("0.4.1").as_deref(), Some("0.4.1"));
+        assert_eq!(parse("client-vnext"), None);
+    }
+
+    #[test]
+    fn current_version_uses_the_callers_version_not_the_librarys() {
+        // The client and server pass their own CARGO_PKG_VERSION.
+        assert_eq!(current_version("1.2.3").to_string(), "1.2.3");
+        // The three crates share the library version today; the point is that
+        // this reflects the argument, not env!("CARGO_PKG_VERSION").
+        assert_eq!(
+            current_version(env!("CARGO_PKG_VERSION")).to_string(),
+            env!("CARGO_PKG_VERSION")
+        );
     }
 
     #[test]

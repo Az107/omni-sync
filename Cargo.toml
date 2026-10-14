@@ -3,6 +3,9 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
+# The shared *library* version (omni-core, -chunk, -netproto, -store, -transfer,
+# -agent, -update). The two binaries carry their own `version` in their crate
+# manifests and release independently on `client-v*` / `server-v*` tags.
 version = "0.4.1"
 edition = "2024"
 rust-version = "1.89"

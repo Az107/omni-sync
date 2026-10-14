@@ -1,6 +1,8 @@
 [package]
 name = "omni-cli"
-version.workspace = true
+# The client and server version independently and release on their own tag
+# trains (`client-v*` / `server-v*`). See AGENTS.md → Versioning.
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

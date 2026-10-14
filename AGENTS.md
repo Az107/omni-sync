@@ -58,24 +58,40 @@ unchanged, so an idle folder does no disk reads.
 
 ## Versioning
 
-One semver for the whole workspace: `[workspace.package] version`, inherited by
-every crate (`version.workspace = true`) and reported by both binaries. Bump it
-in the root `Cargo.toml` together with the `[workspace.dependencies]` path
-entries, and **tag the commit with the same number** (`v0.4.1`): `omni-update`
-compares the release *tag* against the running binary's `CARGO_PKG_VERSION`, so
-a tag that drifts from the manifest makes a self-update think it is already
-current and silently do nothing.
+**The client and the server version and release independently.**
+
+- **`omni-cli` and `omni-server` carry their own `version`** in their crate
+  manifests and are the source of truth for `--version`, `/healthz` and the
+  updater. Release them on their own tag trains: **`client-v<version>`** and
+  **`server-v<version>`**.
+- **The shared libraries** (`omni-core`, `-chunk`, `-netproto`, `-store`,
+  `-transfer`, `-agent`, `-update`) use `[workspace.package] version`. Bump it
+  (plus the `[workspace.dependencies]` path entries) only when a library
+  changes, and release **both** binaries then, since both see the new library.
+- **`omni-update` never reads `env!("CARGO_PKG_VERSION")` itself** — that would
+  resolve to the library's version. Each binary passes its own
+  (`current_version(env!("CARGO_PKG_VERSION"))`), and discovery scans the
+  release list for the newest tag matching the binary's prefix rather than
+  GitHub's repo-wide `/releases/latest`, which cannot distinguish the two.
+- **Tag == the binary's version.** The updater compares the parsed tag against
+  the running binary's version, so a tag that drifts from the manifest makes a
+  self-update think it is already current and silently do nothing.
 
 Compatibility is **not** the semver. It is `omni_netproto::PROTOCOL_VERSION`
 (`1` today), which `enroll` checks; it is bumped only when the wire shape
-changes incompatibly. A client and a server on different patches but the same
+changes incompatibly. A client and a server on different versions but the same
 `PROTOCOL_VERSION` interoperate — so an old server with a new client is fine as
-long as no DTO/endpoint changed. Rule of thumb:
+long as no DTO/endpoint changed. Rule of thumb for either component:
 
-- **patch** (`0.4.x`): no wire/contract change and no new required server
-  capability (e.g. a client-only feature).
-- **minor** (`0.x.0`): a user-facing feature, or anything protocol-affecting.
+- **patch**: no wire/contract change and no new required peer capability.
+- **minor**: a user-facing feature, or anything protocol-affecting.
 - **`1.0`**: protocol freeze; `PROTOCOL_VERSION` then tracks the major.
+
+**Transition note.** A client built before component tags (≤ 0.4.1) reads
+GitHub's repo-wide `latest` and a bare `v*` tag, so `release.yml` still accepts
+a bare `v*` tag as a client build. Until every device is on a component-aware
+client (≥ 0.4.2), cut client releases as `v<version>` once so they can
+auto-update; only the server may move straight to `server-v*`.
 
 ## Commands
 
@@ -110,9 +126,9 @@ cargo run -p omni-cli -- update --restart-daemon    # update, then restart the s
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
 and release-builds both binaries on every push and PR; `release.yml`
-attaches the client and server to a GitHub release when a `v*` tag is
-pushed (or via **Run workflow**). Both pin Rust 1.89.0 to match
-`rust-toolchain.toml`.
+attaches a component to a GitHub release when a **`client-v*`** or
+**`server-v*`** tag is pushed (or via **Run workflow**), and only builds that
+component's targets. Both pin Rust 1.89.0 to match `rust-toolchain.toml`.
 
 Release matrix — the client ships for six targets, the server for two:
 

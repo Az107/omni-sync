@@ -1,14 +1,16 @@
 name: Release
 
-# Tag a commit `v0.2.0` (or run this manually with a tag) to attach the client
-# (linux/macOS/Windows, x64 + arm64) and the server to a GitHub release.
+# Tag `client-v0.4.1` or `server-v0.4.1` (or run this manually with a tag) to
+# publish that component only: the client builds for linux/macOS/Windows
+# (x64 + arm64), the server for linux x64 + arm64. The two version and release
+# independently; see AGENTS.md -> Versioning.
 on:
   push:
-    tags: ["v*"]
+    tags: ["client-v*", "server-v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: Tag to publish (e.g. v0.2.0). Must already exist.
+        description: Tag to publish (e.g. client-v0.4.1). Must already exist.
         required: true
 
 permissions:
@@ -24,26 +26,59 @@ env:
   AWS_LC_SYS_PREBUILT_NASM: "1"
 
 jobs:
+  # Decide which component the tag is for and which targets to build, so a
+  # client release never spends runners rebuilding the server (and vice versa).
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    outputs:
+      component: ${{ steps.pick.outputs.component }}
+      version: ${{ steps.pick.outputs.version }}
+      targets: ${{ steps.pick.outputs.targets }}
+    steps:
+      - id: pick
+        run: |
+          set -euo pipefail
+          case "$TAG" in
+            client-v*) component=client; version="${TAG#client-v}" ;;
+            server-v*) component=server; version="${TAG#server-v}" ;;
+            # Transitional: a client built before component tags only reads
+            # GitHub's repo-wide "latest" and a bare `v*` tag, so a `v*` tag
+            # still builds the client once while devices move across.
+            v*) component=client; version="${TAG#v}" ;;
+            *) echo "::error::tag '$TAG' must start with 'client-v' or 'server-v'"; exit 1 ;;
+          esac
+          if [ "$component" = client ]; then
+            targets='[
+              {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","package":"omni-cli","bin":"omni-sync","native":true},
+              {"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","package":"omni-cli","bin":"omni-sync","native":true},
+              {"os":"macos-latest","target":"aarch64-apple-darwin","package":"omni-cli","bin":"omni-sync","native":true},
+              {"os":"macos-latest","target":"x86_64-apple-darwin","package":"omni-cli","bin":"omni-sync","native":false},
+              {"os":"windows-latest","target":"aarch64-pc-windows-msvc","package":"omni-cli","bin":"omni-sync","native":false},
+              {"os":"windows-latest","target":"x86_64-pc-windows-msvc","package":"omni-cli","bin":"omni-sync","native":true}
+            ]'
+          else
+            targets='[
+              {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","package":"omni-server","bin":"omni-sync-server","native":true},
+              {"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","package":"omni-server","bin":"omni-sync-server","native":true}
+            ]'
+          fi
+          {
+            echo "component=$component"
+            echo "version=$version"
+            echo "targets<<TARGETS"
+            printf '%s\n' "$targets"
+            echo "TARGETS"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.bin }} ${{ matrix.target }}
+    needs: plan
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          # Client — linux, macOS and Windows, arm64 and x64.
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  package: omni-cli,    bin: omni-sync,        native: true }
-          # Native arm64 Linux runner (free for public repos): no cross toolchain.
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, package: omni-cli,    bin: omni-sync,        native: true }
-          - { os: macos-latest,   target: aarch64-apple-darwin,      package: omni-cli,    bin: omni-sync,        native: true }
-          - { os: macos-latest,   target: x86_64-apple-darwin,       package: omni-cli,    bin: omni-sync,        native: false }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc,   package: omni-cli,    bin: omni-sync,        native: false }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc,    package: omni-cli,    bin: omni-sync,        native: true }
-          # Server — linux/x64 and arm64. The container is built on the host's
-          # architecture, so the in-container self-updater needs an asset for
-          # whichever arch the host runs.
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu,  package: omni-server, bin: omni-sync-server, native: true }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, package: omni-server, bin: omni-sync-server, native: true }
+        include: ${{ fromJSON(needs.plan.outputs.targets) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -75,7 +110,7 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           set -euo pipefail
-          name="${{ matrix.bin }}-${TAG#v}-${{ matrix.target }}"
+          name="${{ matrix.bin }}-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           stage="$(mktemp -d)"
           install -m 0755 "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
           tar -C "$stage" -czf "${name}.tar.gz" "${{ matrix.bin }}"
@@ -89,7 +124,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "${{ matrix.bin }}-$($env:TAG -replace '^v','')-${{ matrix.target }}"
+          $name = "${{ matrix.bin }}-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.bin }}.exe" `
             -DestinationPath "$name.zip"
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}.exe" "$name.exe"
@@ -105,8 +140,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: publish ${{ github.workflow }}
-    needs: [build]
+    name: publish
+    needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v8
