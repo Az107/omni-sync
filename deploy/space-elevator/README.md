@@ -85,10 +85,10 @@ verifies it against the release's `SHA256SUMS`, and writes it to
 redeploys because `/state` is a managed volume; delete it to return to
 the image's binary after a `se apps update`.
 
-**While the GitHub repo is private**, the updater needs a token to read
-the release. Set `OMNI_SYNC_GITHUB_TOKEN` for the container (compose
-passes it through when the host environment has it). Once the repo is
-public, unset it.
+**The repository is public**, so the updater reads releases
+unauthenticated and no token is needed. If it goes private again, set
+`OMNI_SYNC_GITHUB_TOKEN` for the container (compose passes it through
+when the host environment has it).
 
 ## Verify from the outside
 
@@ -182,20 +182,21 @@ first deploy.
 
 ## Status
 
-**0.3.0 verified from the outside.**
+**0.4.0 verified from the outside.**
 
-- `GET /healthz` → `{"ok":true,"version":"0.3.0"}`
+- `GET /healthz` → `{"ok":true,"version":"0.4.0"}`
 - `GET /` → `303` to login; login renders the designed dashboard;
-  `/devices` mints a pairing code; `/static/app.css` → `200`;
-  `/static/fonts/archivo-latin.woff2` → `200 font/woff2`.
+  `/devices` mints a pairing code; `/static/app.css` → `200`.
 - `GET /api/v1/folders/{id}/ops/stream` → `401` without a device token,
   which is how the op-log SSE endpoint confirms it is routed.
-- The 0.2.0 → 0.3.0 update was done in-container
+- The 0.3.0 → 0.4.0 update was done in-container
   (`omni-sync-server update --download-only /state/bin`, then
   `se apps restart omni-sync`). PID 1 then ran `/state/bin/omni-sync-server`
-  and `healthz` reported 0.3.0. No migration ran, and devices, folders,
-  ops, versions and overwrites were all still present afterwards, so the
-  restart reused the container and its volumes as intended.
+  and `healthz` reported 0.4.0. No server migration ran (the new migration
+  is agent-side only), and `doctor` still listed the same 4 devices and
+  state dir, so the restart reused the container and its volumes as
+  intended. The release assets are unauthenticated now that the repository
+  is public.
 
 **The release must publish the host's own architecture.** This host and the
 container are `aarch64` and the running binary reports

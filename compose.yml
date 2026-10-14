@@ -22,8 +22,8 @@ services:
       OMNI_SYNC_ADDR: "0.0.0.0:80"
       OMNI_SYNC_DATA_DIR: "/data"
       OMNI_SYNC_STATE_DIR: "/state"
-      # Needed only while the GitHub repo is private, for `omni-sync-server
-      # update` to read the release. Leave unset once the repo is public.
+      # Only needed if the GitHub repo is private, for `omni-sync-server
+      # update` to read the release. The repo is public, so this is unset.
       OMNI_SYNC_GITHUB_TOKEN: "${OMNI_SYNC_GITHUB_TOKEN:-}"
 
 volumes:
