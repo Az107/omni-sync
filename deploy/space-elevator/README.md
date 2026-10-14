@@ -184,6 +184,13 @@ first deploy.
 
 **0.4.0 verified from the outside.**
 
+**Client 0.4.1 shipped; the server stays at 0.4.0 on purpose.** 0.4.1 is a
+client-only change (daemon service install + restart-on-update), so the wire
+contract is unchanged (`PROTOCOL_VERSION` is still 1) and the deployed server
+needs no redeploy. `healthz` therefore keeps reporting `0.4.0`, which is
+accurate — the `omni-sync-server-0.4.1-*` asset exists only for someone who
+later wants the version strings to line up.
+
 - `GET /healthz` → `{"ok":true,"version":"0.4.0"}`
 - `GET /` → `303` to login; login renders the designed dashboard;
   `/devices` mints a pairing code; `/static/app.css` → `200`.

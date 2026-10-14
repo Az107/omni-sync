@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example launchd LaunchAgent for the omni-sync client daemon.
+
+  `omni-sync daemon install` generates the real one at
+  ~/Library/LaunchAgents/dev.albruiz.omni-sync.plist. To install this by hand:
+
+    cp dev.albruiz.omni-sync.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.albruiz.omni-sync.plist
+
+  (Substitute your real absolute paths; launchd does not expand ~.)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.albruiz.omni-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/omni-sync</string>
+    <string>--config</string>
+    <string>/Users/you/Library/Application Support/dev.albruiz.omni-sync/client.toml</string>
+    <string>daemon</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/omni-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/omni-sync.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+</dict>
+</plist>

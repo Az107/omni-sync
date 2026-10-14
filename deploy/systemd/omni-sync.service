@@ -1,0 +1,27 @@
+# Example systemd *user* unit for the omni-sync client daemon.
+#
+# `omni-sync daemon install` generates the real one (with absolute paths) at
+# $XDG_CONFIG_HOME/systemd/user/omni-sync.service. This file is a readable
+# reference for the shape and for a manual install:
+#
+#   install -m644 omni-sync.service ~/.config/systemd/user/omni-sync.service
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now omni-sync
+#   loginctl enable-linger "$USER"   # start at boot, keep running after logout
+
+[Unit]
+Description=omni-sync file sync daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=RUST_LOG=info
+ExecStart=%h/.local/bin/omni-sync --config %h/.config/omni-sync/client.toml daemon
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=100
+StartLimitBurst=10
+
+[Install]
+WantedBy=default.target

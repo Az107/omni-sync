@@ -56,6 +56,27 @@ server that has no stream or a connection that died silently. Scanning
 reuses the last-synced chunk list for any file whose size/mtime/mode are
 unchanged, so an idle folder does no disk reads.
 
+## Versioning
+
+One semver for the whole workspace: `[workspace.package] version`, inherited by
+every crate (`version.workspace = true`) and reported by both binaries. Bump it
+in the root `Cargo.toml` together with the `[workspace.dependencies]` path
+entries, and **tag the commit with the same number** (`v0.4.1`): `omni-update`
+compares the release *tag* against the running binary's `CARGO_PKG_VERSION`, so
+a tag that drifts from the manifest makes a self-update think it is already
+current and silently do nothing.
+
+Compatibility is **not** the semver. It is `omni_netproto::PROTOCOL_VERSION`
+(`1` today), which `enroll` checks; it is bumped only when the wire shape
+changes incompatibly. A client and a server on different patches but the same
+`PROTOCOL_VERSION` interoperate — so an old server with a new client is fine as
+long as no DTO/endpoint changed. Rule of thumb:
+
+- **patch** (`0.4.x`): no wire/contract change and no new required server
+  capability (e.g. a client-only feature).
+- **minor** (`0.x.0`): a user-facing feature, or anything protocol-affecting.
+- **`1.0`**: protocol freeze; `PROTOCOL_VERSION` then tracks the major.
+
 ## Commands
 
 ```sh
@@ -75,11 +96,16 @@ cargo run -p omni-cli -- enroll --server http://127.0.0.1:8787 --code ABCD-EFGHJ
 cargo run -p omni-cli -- folder create Docs
 cargo run -p omni-cli -- add --create Docs ~/Docs   # or `add` with no args for the wizard
 cargo run -p omni-cli -- daemon
+cargo run -p omni-cli -- daemon install             # systemd user unit / launchd agent / logon task
+cargo run -p omni-cli -- daemon status
+cargo run -p omni-cli -- daemon restart             # pick up a freshly installed binary
+cargo run -p omni-cli -- daemon uninstall
 cargo run -p omni-cli -- flush                      # sync now (alias: `sync`)
 cargo run -p omni-cli -- status
 cargo run -p omni-cli -- history Docs notes/todo.md
 cargo run -p omni-cli -- resolve Docs notes/todo.md --to 1
 cargo run -p omni-cli -- update --check             # is a newer release out?
+cargo run -p omni-cli -- update --restart-daemon    # update, then restart the service
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, `cargo test --workspace`
@@ -316,6 +342,20 @@ edits.
 - **CLI prompts only when stdin is a TTY.** `omni-sync enroll`/`add`
   become wizards on a terminal and demand flags otherwise, so scripts and
   CI are unaffected.
+- **`omni-sync daemon install` writes a per-user service, not a system
+  one.** Linux gets a systemd *user* unit (with a printed
+  `loginctl enable-linger` hint; `--system` opts into `/etc/systemd/system`
+  with `User=` set so `0600` control files stay user-owned), macOS a
+  LaunchAgent, Windows a logon Task Scheduler task (never an SCM service —
+  session 0 has no user profile). Generated files are absolute-pathed and
+  carry a `Managed by omni-sync` marker, so re-install is idempotent and
+  only a foreign file needs `--force`; installing a `target/{debug,release}`
+  binary is refused. `daemon` also handles SIGTERM like Ctrl-C so a service
+  stop removes `<stem>.daemon.ctl` cleanly. `update` restarts the service so
+  the new binary runs (`--restart-daemon`/`--no-restart`, or a prompt on a
+  TTY), and `daemon restart` does the same on demand — but only a *running*
+  service is restarted, and a failed restart never fails the update. See
+  `crates/omni-cli/src/service.rs` and `deploy/README.md`.
 - **Config never holds a secret.** The dashboard password is an Argon2
   PHC string; device tokens are stored only as SHA-256
   (`auth::hash_token`). Files under the state dir are opened `0600`.

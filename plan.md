@@ -353,12 +353,13 @@ omni-sync enroll --link '<magic link>'    # browser handoff; or --server/--code
 omni-sync add [<folder> [<path>]]         # wizard when args are omitted
 omni-sync folders                        # folders, membership, applied_seq, device lag
 omni-sync daemon                         # the watcher/agent (systemd per device)
+omni-sync daemon install|uninstall|status|restart  # install it as a per-user service
 omni-sync status [--folder]                     # held files shown with the reason
 omni-sync history <folder> <path>        # version chain
 omni-sync resolve <folder> <path> --to <version>   # rollback from the CLI too
 omni-sync flush [folder] [path]          # override a hold, sync now
 omni-sync doctor                         # server reachability, store, scan lag
-omni-sync update [--check] [--force] [--to <tag>]
+omni-sync update [--check] [--force] [--to <tag>] [--restart-daemon|--no-restart]
 ```
 
 Dashboard (HTMX partials from askama templates, no SPA, no Tauri): Login · Overview (devices
@@ -434,3 +435,31 @@ versions: diff for text, magic-byte preview for images, metadata card and
   running fake "game" process uploads nothing and applies nothing until
   that process exits. `quiet_timeout_secs` bounds both when holder
   detection is unavailable.
+
+## Daemon service installation (2026-10-14)
+
+`omni-sync daemon install|uninstall|status` installs the daemon as a
+per-user service so it starts automatically and survives crashes. The
+platform definitions live in `crates/omni-cli/src/service.rs` as pure
+string generators (unit-tested from any host), with only the install /
+uninstall / status steps behind `#[cfg(target_os)]`:
+
+- **Linux**: a systemd *user* unit (`~/.config/systemd/user/omni-sync.service`),
+  `Restart=on-failure`, and a printed `loginctl enable-linger` hint. `--system`
+  writes `/etc/systemd/system/omni-sync.service` with `User=` set instead.
+- **macOS**: a LaunchAgent in `~/Library/LaunchAgents/` with `RunAtLoad` +
+  `KeepAlive`, logging to `~/Library/Logs/omni-sync.log`.
+- **Windows**: a per-user logon Task Scheduler task (not an SCM service).
+
+Generated files use absolute paths and a `Managed by omni-sync` marker, so
+re-installing is idempotent and only a foreign file needs `--force`. The
+daemon now treats SIGTERM like Ctrl-C, so a service stop cleans up
+`<stem>.daemon.ctl` and its engines. See `deploy/README.md`.
+
+**Restart on update.** `omni-sync update` restarts the service so the new
+binary takes effect: `--restart-daemon` forces it, `--no-restart` suppresses
+it, and on a terminal with a service installed it asks (default yes). Only a
+*running* service is restarted (`try-restart` semantics). The same code backs
+`omni-sync daemon restart`. The decision is a pure, unit-tested function; a
+failed restart is reported but never fails an update that already installed
+the binary.

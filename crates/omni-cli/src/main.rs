@@ -8,6 +8,7 @@
 
 mod daemon;
 mod link;
+mod service;
 mod wizard;
 
 use std::io::IsTerminal as _;
@@ -83,8 +84,14 @@ enum Command {
         #[command(subcommand)]
         action: FolderAction,
     },
-    /// Run the watcher/sync daemon.
-    Daemon,
+    /// Run the watcher/sync daemon, or install it as a service.
+    Daemon {
+        /// Shorthand for `omni-sync daemon install`.
+        #[arg(long, hide = true)]
+        install: bool,
+        #[command(subcommand)]
+        action: Option<DaemonAction>,
+    },
     /// List folders this server knows about.
     Folders,
     /// Show per-folder sync state and any held files.
@@ -106,6 +113,12 @@ enum Command {
         /// A specific release tag (e.g. v0.2.0) instead of the latest.
         #[arg(long)]
         to: Option<String>,
+        /// Restart the installed service after a successful update.
+        #[arg(long, conflicts_with = "no_restart")]
+        restart_daemon: bool,
+        /// Never restart the service and never prompt (for scripts).
+        #[arg(long, conflicts_with = "restart_daemon")]
+        no_restart: bool,
     },
     /// Print the version chain for a file.
     History { folder: String, path: String },
@@ -130,6 +143,43 @@ enum FolderAction {
     Create { name: String },
     /// List folders on the server.
     List,
+}
+
+#[derive(Subcommand)]
+enum DaemonAction {
+    /// Install the daemon as a per-user service and start it.
+    Install {
+        /// Install a system-wide unit instead of a per-user one (systemd only).
+        #[arg(long)]
+        system: bool,
+        /// Write and enable the service but do not start it now.
+        #[arg(long)]
+        no_start: bool,
+        /// Overwrite a service file that omni-sync did not write.
+        #[arg(long)]
+        force: bool,
+        /// Print the generated service definition and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Stop and remove the installed service.
+    Uninstall {
+        /// Remove the system-wide unit instead of the per-user one (systemd only).
+        #[arg(long)]
+        system: bool,
+    },
+    /// Restart the installed service so it runs the current binary.
+    Restart {
+        /// Restart the system-wide unit instead of the per-user one (systemd only).
+        #[arg(long)]
+        system: bool,
+    },
+    /// Report whether the service is installed, enabled and running.
+    Status {
+        /// Inspect the system-wide unit instead of the per-user one (systemd only).
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -224,11 +274,48 @@ async fn main() -> anyhow::Result<()> {
             .await
         }
         Command::Folder { action } => folder_cmd(&config_path, action).await,
-        Command::Daemon => daemon::run(&config_path).await,
+        Command::Daemon { install, action } => match action {
+            Some(DaemonAction::Install {
+                system,
+                no_start,
+                force,
+                dry_run,
+            }) => service::install(
+                &config_path,
+                &service::InstallOptions {
+                    system,
+                    no_start,
+                    force,
+                    dry_run,
+                },
+            ),
+            Some(DaemonAction::Uninstall { system }) => service::uninstall(&config_path, system),
+            Some(DaemonAction::Status { system }) => service::status(&config_path, system),
+            Some(DaemonAction::Restart { system }) => {
+                let outcome = service::restart(if system { Some(true) } else { None })?;
+                println!("{}", describe_restart(outcome));
+                Ok(())
+            }
+            None if install => service::install(&config_path, &service::InstallOptions::default()),
+            None => daemon::run(&config_path).await,
+        },
         Command::Folders => folders(&config_path).await,
         Command::Status { folder } => status(&config_path, folder.as_deref()),
         Command::Doctor => doctor(&config_path).await,
-        Command::Update { check, force, to } => update(check, force, to).await,
+        Command::Update {
+            check,
+            force,
+            to,
+            restart_daemon,
+            no_restart,
+        } => {
+            let restart = match (restart_daemon, no_restart) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            update(check, force, to, restart).await
+        }
         Command::History { folder, path } => history(&config_path, &folder, &path).await,
         Command::Resolve {
             folder,
@@ -528,7 +615,12 @@ fn prepare_path(path: &Path, interactive: bool) -> anyhow::Result<PathBuf> {
 }
 
 /// `omni-sync update`: check GitHub Releases, verify against SHA256SUMS, install.
-async fn update(check: bool, force: bool, to: Option<String>) -> anyhow::Result<()> {
+async fn update(
+    check: bool,
+    force: bool,
+    to: Option<String>,
+    restart: Option<bool>,
+) -> anyhow::Result<()> {
     let binary = "omni-sync";
     let target = omni_update::target();
     let current = omni_update::current_version();
@@ -556,11 +648,62 @@ async fn update(check: bool, force: bool, to: Option<String>) -> anyhow::Result<
     let destination = std::env::current_exe().context("locating the running binary")?;
     println!("downloading and verifying…");
     omni_update::apply(&plan, &destination).await?;
-    println!(
-        "updated {} -> {}; restart the daemon to use it",
-        plan.current, plan.release.version
-    );
-    Ok(())
+    println!("updated {} -> {}", plan.current, plan.release.version);
+
+    apply_restart_decision(restart)
+}
+
+/// A one-line description of a restart attempt, shared by `update` and
+/// `daemon restart`.
+fn describe_restart(outcome: service::RestartOutcome) -> &'static str {
+    match outcome {
+        service::RestartOutcome::Restarted => "restarted the omni-sync service",
+        service::RestartOutcome::NotRunning => {
+            "the omni-sync service is installed but not running; \
+             it will use the new binary on next start"
+        }
+        service::RestartOutcome::NotInstalled => {
+            "no omni-sync service is installed (see `omni-sync daemon install`)"
+        }
+    }
+}
+
+/// After a successful update, restart the service when asked (or offer to on a
+/// terminal), otherwise print the manual hint. Never fails the update: a
+/// restart that cannot happen is reported, not propagated.
+fn apply_restart_decision(explicit: Option<bool>) -> anyhow::Result<()> {
+    let decision = service::restart_decision(explicit, service::is_installed(), interactive());
+    match decision {
+        service::RestartDecision::Skip => {
+            println!("restart the daemon to use the new binary");
+            Ok(())
+        }
+        service::RestartDecision::Prompt => {
+            if wizard::confirm("Restart the omni-sync service to run the new binary?", true)? {
+                restart_service()
+            } else {
+                println!("restart the daemon to use the new binary");
+                Ok(())
+            }
+        }
+        service::RestartDecision::Restart => restart_service(),
+    }
+}
+
+fn restart_service() -> anyhow::Result<()> {
+    match service::restart(None) {
+        Ok(outcome) => {
+            println!("{}", describe_restart(outcome));
+            Ok(())
+        }
+        Err(error) => {
+            // The binary is already in place; a failed restart is not fatal.
+            tracing::warn!(%error, "restarting the service failed");
+            println!("updated, but could not restart the service: {error}");
+            println!("restart it manually to use the new binary");
+            Ok(())
+        }
+    }
 }
 
 async fn folders(config_path: &Path) -> anyhow::Result<()> {

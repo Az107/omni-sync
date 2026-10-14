@@ -303,8 +303,41 @@ pub async fn try_send_command(
     Ok(Some(response.synced))
 }
 
-/// Run the client daemon until Ctrl-C, watching `config_path` for changes and
-/// serving `add` / `flush` requests on the local control socket.
+/// Resolves when the daemon should shut down: Ctrl-C, or (on unix) SIGTERM,
+/// which is how a service manager stops us (`systemctl stop`, `launchctl
+/// bootout`). The signal stream is created once so a SIGTERM is never missed
+/// between select iterations.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    fn new() -> Result<Self> {
+        Ok(Self {
+            #[cfg(unix)]
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .context("installing a SIGTERM handler")?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = self.terminate.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+/// Run the client daemon until Ctrl-C or SIGTERM, watching `config_path` for
+/// changes and serving `add` / `flush` requests on the local control socket.
 pub async fn run(config_path: &Path) -> Result<()> {
     let initial = load_config(config_path)?;
     let store = Store::open_agent(&agent_db_path(config_path))?;
@@ -332,6 +365,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     poll.tick().await;
 
     let mut last_raw = std::fs::read_to_string(config_path).unwrap_or_default();
+    let mut shutdown = Shutdown::new()?;
 
     println!(
         "omni-sync daemon: {} folder(s); watching for changes, streaming the op log",
@@ -341,7 +375,7 @@ pub async fn run(config_path: &Path) -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.recv() => {
                 break;
             }
             accepted = listener.accept() => {
