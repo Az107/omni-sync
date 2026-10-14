@@ -42,10 +42,6 @@ jobs:
           case "$TAG" in
             client-v*) component=client; version="${TAG#client-v}" ;;
             server-v*) component=server; version="${TAG#server-v}" ;;
-            # Transitional: a client built before component tags only reads
-            # GitHub's repo-wide "latest" and a bare `v*` tag, so a `v*` tag
-            # still builds the client once while devices move across.
-            v*) component=client; version="${TAG#v}" ;;
             *) echo "::error::tag '$TAG' must start with 'client-v' or 'server-v'"; exit 1 ;;
           esac
           if [ "$component" = client ]; then

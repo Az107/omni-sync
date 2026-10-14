@@ -195,6 +195,11 @@ The client and server now version and release independently (`client-v*` /
 still bundles a `omni-sync-server-0.4.1-*` asset; the server's own version is
 `0.4.0` in the manifest, and its next release will be tagged `server-v0.4.0`.
 
+**One-time client update.** Devices on ≤ 0.4.1 use the pre-split updater, which
+cannot read a `client-v*` tag; they need a manual binary swap once (download the
+release asset for their target, or reinstall). After that `omni-sync update`
+works off the component tags again.
+
 - `GET /healthz` → `{"ok":true,"version":"0.4.0"}`
 - `GET /` → `303` to login; login renders the designed dashboard;
   `/devices` mints a pairing code; `/static/app.css` → `200`.

@@ -87,11 +87,12 @@ long as no DTO/endpoint changed. Rule of thumb for either component:
 - **minor**: a user-facing feature, or anything protocol-affecting.
 - **`1.0`**: protocol freeze; `PROTOCOL_VERSION` then tracks the major.
 
-**Transition note.** A client built before component tags (≤ 0.4.1) reads
-GitHub's repo-wide `latest` and a bare `v*` tag, so `release.yml` still accepts
-a bare `v*` tag as a client build. Until every device is on a component-aware
-client (≥ 0.4.2), cut client releases as `v<version>` once so they can
-auto-update; only the server may move straight to `server-v*`.
+**Transition note.** A client built before component tags (≤ 0.4.1) follows
+GitHub's repo-wide `latest` and cannot parse a `client-v*` tag, so once the
+first component-tagged client ships its auto-update will error. Update those
+devices **once by hand** — download the release asset for their target or
+reinstall — after which self-update works off the tag prefix. The server has no
+installed base yet, so it moves straight to `server-v*`.
 
 ## Commands
 
