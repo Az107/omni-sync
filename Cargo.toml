@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -11,13 +11,13 @@ repository = "https://github.com/Az107/omni-sync"
 
 [workspace.dependencies]
 # Internal crates.
-omni-agent = { path = "crates/omni-agent", version = "0.3.0" }
-omni-chunk = { path = "crates/omni-chunk", version = "0.3.0" }
-omni-core = { path = "crates/omni-core", version = "0.3.0" }
-omni-netproto = { path = "crates/omni-netproto", version = "0.3.0" }
-omni-store = { path = "crates/omni-store", version = "0.3.0" }
-omni-transfer = { path = "crates/omni-transfer", version = "0.3.0" }
-omni-update = { path = "crates/omni-update", version = "0.3.0" }
+omni-agent = { path = "crates/omni-agent", version = "0.4.0" }
+omni-chunk = { path = "crates/omni-chunk", version = "0.4.0" }
+omni-core = { path = "crates/omni-core", version = "0.4.0" }
+omni-netproto = { path = "crates/omni-netproto", version = "0.4.0" }
+omni-store = { path = "crates/omni-store", version = "0.4.0" }
+omni-transfer = { path = "crates/omni-transfer", version = "0.4.0" }
+omni-update = { path = "crates/omni-update", version = "0.4.0" }
 
 # External. Versions are the ones the `imp` workspace already builds on this
 # host, so most are warm in the registry cache.
