@@ -90,6 +90,28 @@ pub fn touch(conn: &Connection, id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Change a device's display label. Returns false when no such device exists.
+pub fn rename(conn: &Connection, id: &str, name: &str) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE devices SET name = ?2 WHERE id = ?1",
+        params![id, name],
+    )?;
+    Ok(changed > 0)
+}
+
+/// Mark a device revoked, which is what makes its token stop authenticating.
+/// Idempotent: revoking an already-revoked device changes no timestamp. Returns
+/// false when no such device exists.
+pub fn revoke(conn: &Connection, id: &str) -> Result<bool, StoreError> {
+    let changed = conn.execute(
+        "UPDATE devices
+            SET revoked_at = COALESCE(revoked_at, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+          WHERE id = ?1",
+        [id],
+    )?;
+    Ok(changed > 0)
+}
+
 /// A device plus how long ago it was last seen, computed in SQLite so no date
 /// parsing is needed on the Rust side.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,4 +145,78 @@ pub fn list_with_seen(conn: &Connection) -> Result<Vec<DeviceSeen>, StoreError> 
         out.push(row?);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Store;
+
+    fn seed(store: &Store) {
+        let device = Device {
+            id: "d1".into(),
+            name: "laptop".into(),
+            pubkey: vec![],
+            token_hash: vec![1u8; 32],
+            revoked: false,
+            last_seen_at: None,
+        };
+        store.with(|conn| insert(conn, &device)).unwrap();
+    }
+
+    #[test]
+    fn a_device_renames_itself() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+
+        assert!(
+            store
+                .with(|conn| rename(conn, "d1", "workstation"))
+                .unwrap()
+        );
+        let device = store.with(|conn| get(conn, "d1")).unwrap().unwrap();
+        assert_eq!(device.name, "workstation");
+
+        // An unknown device is reported rather than silently accepted.
+        assert!(!store.with(|conn| rename(conn, "nope", "x")).unwrap());
+    }
+
+    #[test]
+    fn a_device_revokes_itself_and_its_token_stops_matching() {
+        let store = Store::open_in_memory().unwrap();
+        seed(&store);
+        assert!(
+            store
+                .with(|conn| by_token_hash(conn, &[1u8; 32]))
+                .unwrap()
+                .is_some()
+        );
+
+        assert!(store.with(|conn| revoke(conn, "d1")).unwrap());
+        let device = store
+            .with(|conn| by_token_hash(conn, &[1u8; 32]))
+            .unwrap()
+            .unwrap();
+        assert!(device.revoked);
+        assert_eq!(store.with(count).unwrap(), 0);
+
+        // Revoking twice stays revoked and keeps the original timestamp.
+        let first = device_revoked_at(&store);
+        assert!(store.with(|conn| revoke(conn, "d1")).unwrap());
+        assert_eq!(device_revoked_at(&store), first);
+
+        assert!(!store.with(|conn| revoke(conn, "nope")).unwrap());
+    }
+
+    fn device_revoked_at(store: &Store) -> Option<String> {
+        store
+            .with(|conn| {
+                Ok(
+                    conn.query_row("SELECT revoked_at FROM devices WHERE id = 'd1'", [], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })?,
+                )
+            })
+            .unwrap()
+    }
 }

@@ -13,3 +13,6 @@ description = "Content-defined chunking (gear-hash FastCDC) for omni-sync"
 # no runtime, no database.
 hex.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

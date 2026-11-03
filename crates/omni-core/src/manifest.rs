@@ -29,8 +29,16 @@ pub struct FileMeta {
 
 impl FileMeta {
     /// Two metas describe the same synced content.
+    ///
+    /// `mode == 0` is the "this client does not track permissions" sentinel:
+    /// it is written by every client of a folder with
+    /// `preserve_permissions = false`, and by clients that cannot express POSIX
+    /// modes at all (mobile/browser). It must compare equal to *any* mode, or
+    /// such a client and a unix daemon would each see a mode change and push
+    /// the same file forever.
     pub fn equivalent(&self, other: &Self) -> bool {
-        self.chunks == other.chunks && self.mode == other.mode
+        self.chunks == other.chunks
+            && (self.mode == other.mode || self.mode == 0 || other.mode == 0)
     }
 }
 
@@ -155,5 +163,23 @@ mod tests {
         let mut executable = base.clone();
         executable.get_mut(&path("run.sh")).unwrap().mode = 0o755;
         assert_eq!(changes(&base, &executable).len(), 1);
+    }
+
+    #[test]
+    fn a_zero_mode_is_a_wildcard() {
+        // A client without POSIX modes reports 0, and must not fight a unix
+        // client that reports the real bits.
+        let mut zero = Manifest::new();
+        zero.insert(path("note.md"), meta(&[("h1", 10)], 0));
+        let mut unix = Manifest::new();
+        unix.insert(path("note.md"), meta(&[("h1", 10)], 0o640));
+
+        assert!(changes(&zero, &unix).is_empty());
+        assert!(changes(&unix, &zero).is_empty());
+        assert!(
+            zero.get(&path("note.md"))
+                .unwrap()
+                .equivalent(unix.get(&path("note.md")).unwrap())
+        );
     }
 }

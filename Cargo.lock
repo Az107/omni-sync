@@ -1370,6 +1370,7 @@ name = "omni-chunk"
 version = "0.4.1"
 dependencies = [
  "hex",
+ "serde_json",
  "sha2 0.10.9",
 ]
 
@@ -1384,6 +1385,7 @@ dependencies = [
  "inquire",
  "notify",
  "omni-agent",
+ "omni-core",
  "omni-netproto",
  "omni-store",
  "omni-transfer",
@@ -1404,6 +1406,7 @@ name = "omni-core"
 version = "0.4.1"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1442,6 +1445,8 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

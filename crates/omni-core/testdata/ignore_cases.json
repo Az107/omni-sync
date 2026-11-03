@@ -1,0 +1,227 @@
+[
+  {
+    "patterns": [".obsidian/workspace.json"],
+    "path": ".obsidian/workspace.json",
+    "ignored": true
+  },
+  {
+    "patterns": [".obsidian/workspace.json"],
+    "path": ".obsidian/workspace-mobile.json",
+    "ignored": false
+  },
+  {
+    "patterns": ["workspace.json"],
+    "path": ".obsidian/workspace.json",
+    "ignored": true
+  },
+  {
+    "patterns": ["workspace.json"],
+    "path": "workspace.json",
+    "ignored": true
+  },
+  {
+    "patterns": ["workspace.json"],
+    "path": "my-workspace.json",
+    "ignored": false
+  },
+  {
+    "patterns": [".obsidian/plugins/*/data.json"],
+    "path": ".obsidian/plugins/templater/data.json",
+    "ignored": true
+  },
+  {
+    "patterns": [".obsidian/plugins/*/data.json"],
+    "path": ".obsidian/plugins/a/b/data.json",
+    "ignored": false
+  },
+  {
+    "patterns": ["*.tmp"],
+    "path": "notes/a.tmp",
+    "ignored": true
+  },
+  {
+    "patterns": ["*.tmp"],
+    "path": "notes/a.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["**/*.tmp"],
+    "path": "a.tmp",
+    "ignored": true
+  },
+  {
+    "patterns": ["**/*.tmp"],
+    "path": "a/b/c.tmp",
+    "ignored": true
+  },
+  {
+    "patterns": ["a/**/b.md"],
+    "path": "a/b.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["a/**/b.md"],
+    "path": "a/x/y/b.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["a/**/b.md"],
+    "path": "a/x/y/c.md",
+    "ignored": false
+  },
+  {
+    "patterns": [".trash/"],
+    "path": ".trash/old.md",
+    "ignored": true
+  },
+  {
+    "patterns": [".trash/"],
+    "path": ".trash",
+    "ignored": true
+  },
+  {
+    "patterns": [".trash/"],
+    "path": "notes/.trash/x.md",
+    "ignored": true
+  },
+  {
+    "patterns": [".obsidian/cache/"],
+    "path": ".obsidian/cache/index",
+    "ignored": true
+  },
+  {
+    "patterns": [".obsidian/cache/"],
+    "path": ".obsidian/cache",
+    "ignored": true
+  },
+  {
+    "patterns": [".obsidian/cache/"],
+    "path": ".obsidian/cachex/a",
+    "ignored": false
+  },
+  {
+    "patterns": ["/notes/draft.md"],
+    "path": "notes/draft.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["/notes/draft.md"],
+    "path": "other/notes/draft.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["/README.md"],
+    "path": "README.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["/README.md"],
+    "path": "docs/README.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["/foo/"],
+    "path": "foo/a.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["/foo/"],
+    "path": "x/foo/a.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["notes/*.md"],
+    "path": "notes/a.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["notes/*.md"],
+    "path": "notes/sub/a.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["notes/**"],
+    "path": "notes/sub/a.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["notes/**"],
+    "path": "notes",
+    "ignored": false
+  },
+  {
+    "patterns": ["?"],
+    "path": "a",
+    "ignored": true
+  },
+  {
+    "patterns": ["?"],
+    "path": "ab",
+    "ignored": false
+  },
+  {
+    "patterns": ["a?c"],
+    "path": "abc",
+    "ignored": true
+  },
+  {
+    "patterns": ["!important.md"],
+    "path": "!important.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["!important.md"],
+    "path": "important.md",
+    "ignored": false
+  },
+  {
+    "patterns": [""],
+    "path": "anything.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["# just a comment"],
+    "path": "anything.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["notes/"],
+    "path": "notes",
+    "ignored": true
+  },
+  {
+    "patterns": ["notes/"],
+    "path": "notesx/a.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["**/x"],
+    "path": "x",
+    "ignored": true
+  },
+  {
+    "patterns": ["Notes/"],
+    "path": "notes/a.md",
+    "ignored": false
+  },
+  {
+    "patterns": ["my notes/"],
+    "path": "my notes/a.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["café.md"],
+    "path": "notes/café.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["a.md", "b.md"],
+    "path": "b.md",
+    "ignored": true
+  },
+  {
+    "patterns": ["a.md", "b.md"],
+    "path": "c.md",
+    "ignored": false
+  }
+]

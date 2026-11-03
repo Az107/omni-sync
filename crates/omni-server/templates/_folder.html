@@ -27,4 +27,23 @@
       {% endfor %}
     </ul>
   {% endif %}
+  {% if !compact %}
+    <details class="folder-policy">
+      <summary>Sync policy</summary>
+      <form class="policy-form" method="post" action="/folders/{{ folder.id }}/settings">
+        <label class="policy-field">
+          <span class="policy-label">Exclude patterns — one per line, matched against the vault-relative path</span>
+          <textarea class="input policy-input" name="exclude" rows="4" spellcheck="false"
+                    placeholder=".obsidian/workspace.json">{% for pattern in folder.exclude %}{{ pattern }}
+{% endfor %}</textarea>
+        </label>
+        <label class="policy-check">
+          <input type="checkbox" name="preserve_permissions" value="1"
+                 {% if folder.preserve_permissions %}checked{% endif %}>
+          Preserve file permissions (turn off for mobile clients and Obsidian vaults)
+        </label>
+        <button class="btn" type="submit">Save policy</button>
+      </form>
+    </details>
+  {% endif %}
 </article>

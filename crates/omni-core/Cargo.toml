@@ -11,3 +11,6 @@ description = "Pure sync semantics for omni-sync: ops, versions and the last-wri
 # serde only: these are plain value types. Still no I/O, no runtime, no
 # database, no network — the point is that the rules stay testable in isolation.
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

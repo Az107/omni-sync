@@ -487,6 +487,46 @@ code {
   font-size: var(--text-sm);
 }
 
+/* The folder's sync policy: excludes and the permission sentinel. */
+.folder-policy {
+  border-top: 1px solid var(--line);
+  padding: 0.7rem 1rem 0.9rem;
+  font-size: var(--text-sm);
+}
+.folder-policy summary {
+  cursor: pointer;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.policy-form {
+  display: grid;
+  gap: 0.7rem;
+  margin-top: 0.8rem;
+}
+.policy-field {
+  display: grid;
+  gap: 0.35rem;
+}
+.policy-label {
+  color: var(--ink-3);
+  font-size: var(--text-xs);
+}
+.policy-input {
+  width: 100%;
+  resize: vertical;
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+.policy-check {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  color: var(--ink-2);
+}
+.policy-form .btn {
+  justify-self: start;
+}
+
 .members {
   margin: 0;
   padding: 0;

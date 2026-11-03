@@ -10,7 +10,18 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use omni_chunk::{Chunker, HashedChunk};
-use omni_core::{ChunkRef, FileMeta, Manifest, PathBytes};
+use omni_core::{ChunkRef, FileMeta, Ignore, Manifest, PathBytes};
+
+/// How a scan should treat the folder's policy.
+#[derive(Clone)]
+pub struct ScanOptions {
+    /// Folder-level excludes, shared with every other client.
+    pub ignore: Ignore,
+    /// When false, report `mode = 0` for every file. The plugin/mobile client
+    /// cannot express POSIX modes, and `FileMeta::equivalent` compares mode, so
+    /// a folder shared with it must agree on a single sentinel.
+    pub preserve_permissions: bool,
+}
 
 /// Scan `root` recursively into a manifest.
 ///
@@ -23,9 +34,14 @@ use omni_core::{ChunkRef, FileMeta, Manifest, PathBytes};
 /// re-verify would close that hole at the price of reading the whole tree; it is
 /// deliberately not wired into the steady-state loop, and belongs in an
 /// explicit `omni verify` command instead.
-pub fn scan(root: &Path, chunker: &Chunker, previous: &Manifest) -> io::Result<Manifest> {
+pub fn scan(
+    root: &Path,
+    chunker: &Chunker,
+    previous: &Manifest,
+    options: ScanOptions,
+) -> io::Result<Manifest> {
     let mut manifest = Manifest::new();
-    walk(root, root, chunker, previous, &mut manifest)?;
+    walk(root, root, chunker, previous, &options, &mut manifest)?;
     Ok(manifest)
 }
 
@@ -35,6 +51,7 @@ pub fn chunk_file(
     root: &Path,
     rel: &[u8],
     chunker: &Chunker,
+    preserve_permissions: bool,
 ) -> io::Result<(FileMeta, Vec<HashedChunk>)> {
     let path = root.join(path_from_bytes(rel));
     let bytes = fs::read(&path)?;
@@ -49,17 +66,19 @@ pub fn chunk_file(
     let file_meta = FileMeta {
         size: bytes.len() as u64,
         mtime_ns: mtime_ns(&meta),
-        mode: mode(&meta),
+        mode: mode(&meta, preserve_permissions),
         chunks,
     };
     Ok((file_meta, hashed))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     root: &Path,
     dir: &Path,
     chunker: &Chunker,
     previous: &Manifest,
+    options: &ScanOptions,
     manifest: &mut Manifest,
 ) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
@@ -70,23 +89,27 @@ fn walk(
         }
         let path = entry.path();
         let file_type = entry.file_type()?;
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let rel_bytes = path_bytes(rel);
+        if options.ignore.matches(&rel_bytes) {
+            continue;
+        }
 
         if file_type.is_dir() {
-            walk(root, &path, chunker, previous, manifest)?;
+            walk(root, &path, chunker, previous, options, manifest)?;
         } else if file_type.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path);
             let meta = fs::metadata(&path)?;
             let mtime = mtime_ns(&meta);
-            let mode = mode(&meta);
+            let mode = mode(&meta, options.preserve_permissions);
 
             // Fast path: identical metadata to last sync → reuse the known
             // chunks without reading a byte.
-            if let Some(known) = previous.get(&path_bytes(rel))
+            if let Some(known) = previous.get(&rel_bytes)
                 && known.size == meta.len()
                 && known.mtime_ns == mtime
                 && known.mode == mode
             {
-                manifest.insert(path_bytes(rel), known.clone());
+                manifest.insert(rel_bytes, known.clone());
                 continue;
             }
 
@@ -97,7 +120,7 @@ fn walk(
                 .map(|chunk| ChunkRef::new(chunk.hash, chunk.len))
                 .collect();
             manifest.insert(
-                path_bytes(rel),
+                rel_bytes,
                 FileMeta {
                     size: bytes.len() as u64,
                     mtime_ns: mtime,
@@ -162,14 +185,18 @@ fn mtime_ns(meta: &fs::Metadata) -> i64 {
 }
 
 #[cfg(unix)]
-fn mode(meta: &fs::Metadata) -> u32 {
+fn mode(meta: &fs::Metadata, preserve_permissions: bool) -> u32 {
     use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode() & 0o7777
+    if preserve_permissions {
+        meta.permissions().mode() & 0o7777
+    } else {
+        0
+    }
 }
 
 #[cfg(not(unix))]
-fn mode(_meta: &fs::Metadata) -> u32 {
-    0o644
+fn mode(_meta: &fs::Metadata, preserve_permissions: bool) -> u32 {
+    if preserve_permissions { 0o644 } else { 0 }
 }
 
 #[cfg(test)]
@@ -178,11 +205,19 @@ mod tests {
     use crate::apply;
     use omni_chunk::{Chunker, Config};
 
+    fn options(ignore: &Ignore, preserve_permissions: bool) -> ScanOptions {
+        ScanOptions {
+            ignore: ignore.clone(),
+            preserve_permissions,
+        }
+    }
+
     #[test]
     fn scan_then_apply_reproduces_the_manifest() {
         let chunker = Chunker::new(Config::small());
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
+        let ignore = Ignore::default();
 
         std::fs::create_dir_all(source.path().join("sub")).unwrap();
         std::fs::write(source.path().join("a.txt"), b"hello world").unwrap();
@@ -191,12 +226,18 @@ mod tests {
         std::fs::write(source.path().join(".DS_Store"), b"junk").unwrap();
         std::fs::write(source.path().join("wip.part"), b"partial").unwrap();
 
-        let manifest = scan(source.path(), &chunker, &Manifest::new()).unwrap();
+        let manifest = scan(
+            source.path(),
+            &chunker,
+            &Manifest::new(),
+            options(&ignore, true),
+        )
+        .unwrap();
         assert_eq!(manifest.len(), 2, "ignored files must be skipped");
 
         // Write each file into the target using the pulled bytes.
         for (rel, meta) in &manifest {
-            let (_, hashed) = chunk_file(source.path(), rel, &chunker).unwrap();
+            let (_, hashed) = chunk_file(source.path(), rel, &chunker, true).unwrap();
             let mut bytes = Vec::new();
             for chunk in &hashed {
                 bytes.extend_from_slice(&chunk.data);
@@ -204,7 +245,13 @@ mod tests {
             apply::write_file(target.path(), rel, &bytes, meta).unwrap();
         }
 
-        let reapplied = scan(target.path(), &chunker, &Manifest::new()).unwrap();
+        let reapplied = scan(
+            target.path(),
+            &chunker,
+            &Manifest::new(),
+            options(&ignore, true),
+        )
+        .unwrap();
         assert_eq!(
             reapplied.keys().collect::<Vec<_>>(),
             manifest.keys().collect::<Vec<_>>(),
@@ -221,6 +268,51 @@ mod tests {
     }
 
     #[test]
+    fn excluded_paths_never_enter_the_manifest() {
+        let chunker = Chunker::new(Config::small());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".obsidian/cache")).unwrap();
+        std::fs::create_dir_all(root.path().join("notes")).unwrap();
+        std::fs::write(root.path().join(".obsidian/workspace.json"), b"{}").unwrap();
+        std::fs::write(root.path().join(".obsidian/cache/index"), b"junk").unwrap();
+        std::fs::write(root.path().join(".obsidian/appearance.json"), b"{}").unwrap();
+        std::fs::write(root.path().join("notes/todo.md"), b"hello").unwrap();
+
+        let ignore = Ignore::vault_defaults();
+        let manifest = scan(
+            root.path(),
+            &chunker,
+            &Manifest::new(),
+            options(&ignore, false),
+        )
+        .unwrap();
+
+        let paths: Vec<String> = manifest
+            .keys()
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect();
+        assert_eq!(paths, vec![".obsidian/appearance.json", "notes/todo.md"]);
+    }
+
+    #[test]
+    fn permissions_are_reported_as_zero_when_the_folder_does_not_preserve_them() {
+        let chunker = Chunker::new(Config::small());
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.sh"), b"#!/bin/sh\n").unwrap();
+        let ignore = Ignore::default();
+
+        // Both platforms report 0, so a browser client and a unix daemon agree.
+        let manifest = scan(
+            root.path(),
+            &chunker,
+            &Manifest::new(),
+            options(&ignore, false),
+        )
+        .unwrap();
+        assert_eq!(manifest.get(b"a.sh".as_slice()).unwrap().mode, 0);
+    }
+
+    #[test]
     fn removing_a_missing_file_is_not_an_error() {
         let root = tempfile::tempdir().unwrap();
         apply::remove_file(root.path(), b"never-existed").unwrap();
@@ -232,12 +324,19 @@ mod tests {
 
         let chunker = Chunker::new(Config::small());
         let root = tempfile::tempdir().unwrap();
+        let ignore = Ignore::default();
         std::fs::write(root.path().join("a.txt"), b"hello world").unwrap();
 
         // A "previous" manifest with correct metadata but deliberately wrong
         // chunks. If the fast path works, the scan reuses those chunks without
         // reading the file — proving it did not hash it.
-        let real = scan(root.path(), &chunker, &Manifest::new()).unwrap();
+        let real = scan(
+            root.path(),
+            &chunker,
+            &Manifest::new(),
+            options(&ignore, true),
+        )
+        .unwrap();
         let mut poisoned = real.clone();
         poisoned.insert(
             b"a.txt".to_vec(),
@@ -249,7 +348,7 @@ mod tests {
             },
         );
 
-        let rescanned = scan(root.path(), &chunker, &poisoned).unwrap();
+        let rescanned = scan(root.path(), &chunker, &poisoned, options(&ignore, true)).unwrap();
         assert_eq!(
             rescanned.get(b"a.txt".as_slice()).unwrap().chunks,
             vec![ChunkRef::new("poisoned", 11)],

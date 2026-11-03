@@ -83,10 +83,40 @@ impl Client {
     }
 
     pub async fn create_folder(&self, name: &str) -> Result<FolderDto, TransferError> {
+        self.create_folder_with(name, Vec::new(), true).await
+    }
+
+    /// Create a folder with an explicit sync policy (the vault preset, for
+    /// example). The server stores it and every client follows it.
+    pub async fn create_folder_with(
+        &self,
+        name: &str,
+        exclude: Vec<String>,
+        preserve_permissions: bool,
+    ) -> Result<FolderDto, TransferError> {
         let url = self.endpoint("/api/v1/folders")?;
         let request = self.auth(self.http.post(url)).json(&CreateFolderRequest {
             name: name.to_owned(),
+            exclude,
+            preserve_permissions,
         });
+        json(request.send().await?).await
+    }
+
+    /// Change a folder's sync policy. `None` leaves a field unchanged.
+    pub async fn update_folder(
+        &self,
+        folder_id: &str,
+        exclude: Option<Vec<String>>,
+        preserve_permissions: Option<bool>,
+    ) -> Result<FolderDto, TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}"))?;
+        let request = self
+            .auth(self.http.patch(url))
+            .json(&omni_netproto::UpdateFolderRequest {
+                exclude,
+                preserve_permissions,
+            });
         json(request.send().await?).await
     }
 
@@ -94,6 +124,12 @@ impl Client {
         let url = self.endpoint("/api/v1/folders")?;
         let response: FoldersResponse = json(self.auth(self.http.get(url)).send().await?).await?;
         Ok(response.folders)
+    }
+
+    /// One folder, including its sync policy.
+    pub async fn get_folder(&self, folder_id: &str) -> Result<FolderDto, TransferError> {
+        let url = self.endpoint(&format!("/api/v1/folders/{folder_id}"))?;
+        json(self.auth(self.http.get(url)).send().await?).await
     }
 
     /// Tell the server this device holds a folder at a root. `root_path` is raw

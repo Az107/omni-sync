@@ -7,7 +7,7 @@
 //! `omni-sync add` and `omni-sync flush` can ask the running daemon to sync
 //! immediately without opening a competing `Engine` on the same database.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -25,6 +25,10 @@ use tokio::task::JoinHandle;
 use crate::{ClientConfig, WatchEntry, agent_db_path, engine_config, load_config, write_private};
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the daemon re-reads folder settings from the server. Excludes and
+/// the permission policy are folder properties, so a dashboard/plugin edit must
+/// reach every client without a restart.
+const FOLDER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 /// What changed between the currently running folder set and a newly loaded
 /// config. Pure, so it is unit-tested in isolation.
@@ -129,11 +133,11 @@ impl FolderManager {
         // reachable, skip stale folder ids that do not exist on the server. If
         // the server is unreachable (offline), keep all entries so they sync
         // once connectivity returns.
-        let server_folders: Option<BTreeSet<String>> = client
+        let server_folders: Option<BTreeMap<String, omni_netproto::FolderDto>> = client
             .list_folders()
             .await
             .ok()
-            .map(|list| list.into_iter().map(|f| f.id).collect());
+            .map(|list| list.into_iter().map(|f| (f.id.clone(), f)).collect());
 
         let mut valid = Vec::new();
         for entry in &config.folders {
@@ -145,16 +149,25 @@ impl FolderManager {
                 );
                 continue;
             }
-            if let Some(known) = &server_folders
-                && !known.contains(&entry.folder_id)
-            {
-                tracing::warn!(
-                    folder = %entry.folder_id,
-                    "folder does not exist on the server; skipping"
-                );
-                continue;
+            let mut entry = entry.clone();
+            if let Some(known) = &server_folders {
+                match known.get(&entry.folder_id) {
+                    // The server owns excludes and the permission policy, so a
+                    // settings change there restarts this folder's engine.
+                    Some(folder) => {
+                        entry.exclude = folder.exclude.clone();
+                        entry.preserve_permissions = folder.preserve_permissions;
+                    }
+                    None => {
+                        tracing::warn!(
+                            folder = %entry.folder_id,
+                            "folder does not exist on the server; skipping"
+                        );
+                        continue;
+                    }
+                }
             }
-            valid.push(entry.clone());
+            valid.push(entry);
         }
 
         let diff = diff_folders(&self.running_entries(), &valid);
@@ -364,6 +377,10 @@ pub async fn run(config_path: &Path) -> Result<()> {
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     poll.tick().await;
 
+    let mut refresh = tokio::time::interval(FOLDER_REFRESH_INTERVAL);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    refresh.tick().await;
+
     let mut last_raw = std::fs::read_to_string(config_path).unwrap_or_default();
     let mut shutdown = Shutdown::new()?;
 
@@ -395,6 +412,16 @@ pub async fn run(config_path: &Path) -> Result<()> {
             }
             _ = poll.tick() => {
                 reload_if_changed(config_path, &mut last_raw, &mut manager).await;
+            }
+            _ = refresh.tick() => {
+                // Pick up folder-policy changes made on the server or in the
+                // dashboard. `reconcile` diffs entries, so an unchanged folder
+                // keeps its engine running.
+                if let Ok(config) = toml::from_str::<ClientConfig>(&last_raw)
+                    && let Err(error) = manager.reconcile(&config).await
+                {
+                    tracing::warn!(%error, "refreshing folder settings failed");
+                }
             }
         }
     }
@@ -538,6 +565,8 @@ mod tests {
             mode: mode.into(),
             hold_while_process: Vec::new(),
             quiet_timeout_secs: None,
+            exclude: Vec::new(),
+            preserve_permissions: true,
         }
     }
 

@@ -17,6 +17,7 @@ hex.workspace = true
 inquire.workspace = true
 notify.workspace = true
 omni-agent.workspace = true
+omni-core.workspace = true
 omni-netproto.workspace = true
 omni-store.workspace = true
 omni-transfer.workspace = true

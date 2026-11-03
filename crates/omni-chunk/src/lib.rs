@@ -10,6 +10,8 @@
 
 mod gear;
 mod hash;
+#[doc(hidden)]
+pub mod testdata;
 
 use std::io::{self, Read};
 
@@ -312,5 +314,38 @@ mod tests {
 
         // The same bytes chunk to the same addresses, twice.
         assert_eq!(hashed, c.chunk_and_hash(&data));
+    }
+
+    /// The TypeScript port in the Obsidian plugin is only useful if it cuts at
+    /// the same offsets. These vectors are the contract; the plugin ships a copy
+    /// of the same file.
+    #[test]
+    fn golden_boundaries_match_the_committed_vectors() {
+        let doc: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/chunk_vectors.json")).unwrap();
+        let cfg = &doc["config"];
+        let config = Config {
+            min: cfg["min"].as_u64().unwrap() as usize,
+            avg: cfg["avg"].as_u64().unwrap() as usize,
+            max: cfg["max"].as_u64().unwrap() as usize,
+        };
+        assert_eq!(config, Config::default(), "vectors must track the defaults");
+        let chunker = Chunker::new(config);
+
+        for case in doc["cases"].as_array().unwrap() {
+            let data = testdata::fixture(
+                case["generator"].as_str().unwrap(),
+                case["len"].as_u64().unwrap() as usize,
+                case["seed"].as_u64().unwrap_or(0),
+            );
+            let actual: Vec<usize> = chunker.split(&data).iter().map(|chunk| chunk.len).collect();
+            let expected: Vec<usize> = case["lens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|len| len.as_u64().unwrap() as usize)
+                .collect();
+            assert_eq!(actual, expected, "case {:?}", case["name"]);
+        }
     }
 }

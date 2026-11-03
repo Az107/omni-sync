@@ -207,7 +207,49 @@ and a client verifies every downloaded chunk before its rename.
 - Offline: ops journal to `pending_ops`; reconnect replays idempotently
   with backoff. Chunk cache doubles as resume state.
 - `.omniignore` per root (gitignore syntax) plus global excludes
-  (`.DS_Store`, `*.tmp`, caches).
+  (`.DS_Store`, `*.tmp`, caches). **Implemented as -- see "Folder policy"
+  below.**
+
+## Folder policy: excludes and permissions
+
+Two folder settings are **server-side properties**, not per-device config,
+because two clients of one folder must agree or they fight: each keeps
+pushing a file the other keeps ignoring.
+
+- `folders.exclude` — a JSON array of path patterns, matched by
+  `omni_core::Ignore` (byte-wise, `/`-separated). Syntax: `*` does not cross
+  a `/`, `**` does, `?` is one byte, a trailing `/` matches a directory
+  subtree, and a pattern with no `/` matches any path segment. The plugin
+  ships a TypeScript port; `crates/omni-core/testdata/ignore_cases.json` is
+  the shared contract.
+- `folders.preserve_permissions` — when false, every client reports
+  `mode = 0` and `apply` skips `chmod`. `FileMeta::equivalent` treats
+  `mode = 0` as a **wildcard**, so a client that cannot express POSIX modes
+  (mobile/browser, the Obsidian plugin) can share a folder with a unix
+  daemon without either side seeing a mode change on every scan.
+
+Both are exposed on `FolderDto`, editable with `PATCH /api/v1/folders/{id}`
+and on the dashboard's folders page, mirrored into `client.toml` by `add`
+and refreshed by the daemon every 60 s.
+
+An excluded path is *invisible*, never deleted: the push baseline
+(`last`) is filtered through the same matcher as the scan, so gaining an
+exclude cannot turn into a `Delete` on every other device, and `pull`
+skips excluded ops while still advancing `applied_seq`.
+
+Obsidian vault preset (`omni-sync folder create <name> --vault`, or the
+plugin's onboarding):
+
+```toml
+exclude = [
+  ".obsidian/workspace.json",
+  ".obsidian/workspace-mobile.json",
+  ".obsidian/cache/",
+  ".trash/",
+  ".obsidian/plugins/*/data.json",
+]
+preserve_permissions = false
+```
 
 ## Sync modes: live vs on-close
 
@@ -221,7 +263,9 @@ every folder (or pattern within it) declares a mode:
 [[folders]]
 path = "~/Vaults/Notes"
 mode = "live"                      # any change, debounced 500 ms
-exclude = [".obsidian/workspace.json", ".obsidian/cache", ".trash/"]
+# excludes now live on the folder, not in client.toml:
+#   omni-sync folder create Notes --vault
+#   PATCH /api/v1/folders/{id}  {"exclude": [...], "preserve_permissions": false}
 
 [[folders]]
 path = "~/Games/Saves"

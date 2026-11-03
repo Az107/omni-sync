@@ -140,7 +140,13 @@ enum Command {
 #[derive(Subcommand)]
 enum FolderAction {
     /// Create a shared folder on the server and print its id.
-    Create { name: String },
+    Create {
+        name: String,
+        /// Create it with the Obsidian vault preset: volatile `.obsidian`
+        /// files and `.trash/` excluded, permissions not preserved.
+        #[arg(long)]
+        vault: bool,
+    },
     /// List folders on the server.
     List,
 }
@@ -201,10 +207,20 @@ pub(crate) struct WatchEntry {
     pub(crate) hold_while_process: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) quiet_timeout_secs: Option<u64>,
+    /// Mirrored from the server's folder settings; the server is the source of
+    /// truth so two clients of one folder cannot disagree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exclude: Vec<String>,
+    #[serde(default = "default_true")]
+    pub(crate) preserve_permissions: bool,
 }
 
 fn default_mode() -> String {
     "live".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub(crate) fn engine_config(entry: &WatchEntry) -> anyhow::Result<EngineConfig> {
@@ -216,7 +232,9 @@ pub(crate) fn engine_config(entry: &WatchEntry) -> anyhow::Result<EngineConfig> 
     Ok(
         EngineConfig::new(entry.folder_id.clone(), entry.path.clone())
             .with_mode(mode)
-            .with_hold_rule(hold_rule),
+            .with_hold_rule(hold_rule)
+            .with_exclude(entry.exclude.clone())
+            .with_preserve_permissions(entry.preserve_permissions),
     )
 }
 
@@ -530,12 +548,22 @@ async fn add(
         .await
         .with_context(|| format!("registering membership for folder {folder_id}"))?;
 
+    // The server owns the folder's sync policy. Mirror it into the local entry
+    // so this daemon and any other client of the folder agree on what to ignore
+    // and whether POSIX modes matter.
+    let settings = client
+        .get_folder(&folder_id)
+        .await
+        .with_context(|| format!("reading folder {folder_id} settings"))?;
+
     let new_entry = WatchEntry {
         folder_id: folder_id.clone(),
         path: path.clone(),
         mode,
         hold_while_process,
         quiet_timeout_secs,
+        exclude: settings.exclude,
+        preserve_permissions: settings.preserve_permissions,
     };
     let cfg = engine_config(&new_entry)?;
 
@@ -575,8 +603,21 @@ async fn folder_cmd(config_path: &Path, action: FolderAction) -> anyhow::Result<
     let config = load_config(config_path)?;
     let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
     match action {
-        FolderAction::Create { name } => {
-            let created = client.create_folder(&name).await?;
+        FolderAction::Create { name, vault } => {
+            let created = if vault {
+                client
+                    .create_folder_with(
+                        &name,
+                        omni_core::VAULT_EXCLUDES
+                            .iter()
+                            .map(|pattern| (*pattern).to_string())
+                            .collect(),
+                        false,
+                    )
+                    .await?
+            } else {
+                client.create_folder(&name).await?
+            };
             println!("{}", created.id);
         }
         FolderAction::List => {
@@ -716,6 +757,26 @@ async fn folders(config_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Apply the server's folder policy to a local config entry.
+///
+/// The server is the source of truth for excludes and the permission policy.
+/// When it is unreachable the local copy is kept, so an offline `flush` still
+/// ignores what it ignored last time.
+async fn refresh_entry(client: &omni_transfer::Client, entry: &WatchEntry) -> WatchEntry {
+    match client.get_folder(&entry.folder_id).await {
+        Ok(folder) => {
+            let mut entry = entry.clone();
+            entry.exclude = folder.exclude;
+            entry.preserve_permissions = folder.preserve_permissions;
+            entry
+        }
+        Err(error) => {
+            tracing::debug!(folder = %entry.folder_id, %error, "using the stored folder policy");
+            entry.clone()
+        }
+    }
+}
+
 fn status(config_path: &Path, filter: Option<&str>) -> anyhow::Result<()> {
     let config = load_config(config_path)?;
     let store = Store::open_agent(&agent_db_path(config_path))?;
@@ -781,8 +842,12 @@ async fn flush(config_path: &Path, folder: Option<&str>, path: Option<&str>) -> 
         if !matched {
             continue;
         }
-        let cfg = engine_config(entry)?;
         let client = omni_transfer::Client::new(&config.server)?.with_token(config.token.clone());
+        // The server owns excludes and the permission policy; a stale local
+        // copy would make this one-shot engine behave differently from the
+        // daemon and from every other client.
+        let entry = refresh_entry(&client, entry).await;
+        let cfg = engine_config(&entry)?;
         let engine = Engine::new(client, store.clone(), cfg);
         engine.flush_once(target_path.as_deref()).await?;
         synced += 1;
@@ -970,6 +1035,8 @@ mod tests {
         FolderDto {
             id: id.into(),
             name: name.into(),
+            exclude: Vec::new(),
+            preserve_permissions: true,
         }
     }
 
@@ -1002,6 +1069,8 @@ mod tests {
             mode: "on_close".into(),
             hold_while_process: vec!["steam*".into()],
             quiet_timeout_secs: Some(30),
+            exclude: vec![],
+            preserve_permissions: true,
         };
         let cfg = engine_config(&entry).unwrap();
         assert_eq!(cfg.mode, SyncMode::OnClose);

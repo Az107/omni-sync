@@ -226,6 +226,8 @@ mod tests {
             retention_versions: 50,
             retention_days: 90,
             encrypted: false,
+            exclude: Vec::new(),
+            preserve_permissions: true,
         };
         store.with(|conn| folders::create(conn, &folder)).unwrap();
         let all = store.with(folders::list).unwrap();

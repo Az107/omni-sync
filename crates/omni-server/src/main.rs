@@ -174,13 +174,7 @@ fn folder(explicit: Option<&std::path::Path>, action: FolderAction) -> anyhow::R
         .with_context(|| format!("opening {}", config.db_path().display()))?;
     match action {
         FolderAction::Create { name } => {
-            let folder = folders::Folder {
-                id: uuid::Uuid::now_v7().to_string(),
-                name,
-                retention_versions: 50,
-                retention_days: 90,
-                encrypted: false,
-            };
+            let folder = folders::Folder::new(uuid::Uuid::now_v7().to_string(), name);
             let id = folder.id.clone();
             store.with(|conn| folders::create(conn, &folder))?;
             println!("{id}");

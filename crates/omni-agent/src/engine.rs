@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use omni_chunk::Chunker;
-use omni_core::{Change, FileMeta, Op, OpKind, PathBytes, changes};
+use omni_core::{Change, FileMeta, Ignore, Manifest, Op, OpKind, PathBytes, changes};
 use omni_netproto::{OpDto, OpKindDto, decode_chunks, decode_path};
 use omni_store::{Store, agent};
 use omni_transfer::Client;
@@ -89,6 +89,12 @@ pub struct EngineConfig {
     pub root: PathBuf,
     pub mode: SyncMode,
     pub hold_rule: HoldRule,
+    /// Folder-level excludes shared with every other client. Empty means only
+    /// the built-in droppings in [`crate::scan::is_ignored`].
+    pub exclude: Vec<String>,
+    /// When false, report `mode = 0` and never chmod on apply. Required when a
+    /// client that cannot express POSIX modes shares the folder.
+    pub preserve_permissions: bool,
 }
 
 impl EngineConfig {
@@ -98,6 +104,8 @@ impl EngineConfig {
             root: root.into(),
             mode: SyncMode::Live,
             hold_rule: HoldRule::default(),
+            exclude: Vec::new(),
+            preserve_permissions: true,
         }
     }
 
@@ -108,6 +116,16 @@ impl EngineConfig {
 
     pub fn with_hold_rule(mut self, hold_rule: HoldRule) -> Self {
         self.hold_rule = hold_rule;
+        self
+    }
+
+    pub fn with_exclude(mut self, exclude: Vec<String>) -> Self {
+        self.exclude = exclude;
+        self
+    }
+
+    pub fn with_preserve_permissions(mut self, preserve_permissions: bool) -> Self {
+        self.preserve_permissions = preserve_permissions;
         self
     }
 }
@@ -128,6 +146,7 @@ pub struct Engine {
     client: Client,
     store: Store,
     chunker: Chunker,
+    ignore: Ignore,
     config: EngineConfig,
 }
 
@@ -140,10 +159,12 @@ struct Pending {
 
 impl Engine {
     pub fn new(client: Client, store: Store, config: EngineConfig) -> Self {
+        let ignore = Ignore::new(&config.exclude);
         Self {
             client,
             store,
             chunker: Chunker::new(omni_chunk::Config::default()),
+            ignore,
             config,
         }
     }
@@ -322,12 +343,27 @@ impl Engine {
             (last, versions, seq, held)
         };
 
+        // A newly excluded path must leave the *baseline* as well as the scan.
+        // `changes` treats a path in `last` but not in `current` as a Delete,
+        // so leaving it here would delete the file on every other device the
+        // moment a folder's excludes change.
+        let last = baseline_excluding(last, &self.ignore);
+        let previously_held: std::collections::BTreeMap<PathBytes, String> = previously_held
+            .into_iter()
+            .filter(|(path, _)| !self.ignore.matches(path))
+            .collect();
+
         // Scan, reusing the last-synced chunks for files whose metadata is
         // unchanged (so an idle folder does no disk reads at all).
         let (root, chunker, previous) = (self.config.root.clone(), self.chunker, last.clone());
-        let current = tokio::task::spawn_blocking(move || scan::scan(&root, &chunker, &previous))
-            .await
-            .context("scan task panicked")??;
+        let options = scan::ScanOptions {
+            ignore: self.ignore.clone(),
+            preserve_permissions: self.config.preserve_permissions,
+        };
+        let current =
+            tokio::task::spawn_blocking(move || scan::scan(&root, &chunker, &previous, options))
+                .await
+                .context("scan task panicked")??;
 
         let local = changes(&last, &current);
         let dirty_paths: BTreeSet<PathBytes> = local
@@ -395,8 +431,9 @@ impl Engine {
                 Change::Put { path, .. } => {
                     let (root, rel) = (self.config.root.clone(), path.clone());
                     let chunker = self.chunker;
+                    let preserve_permissions = self.config.preserve_permissions;
                     let (meta, hashed) = tokio::task::spawn_blocking(move || {
-                        scan::chunk_file(&root, &rel, &chunker)
+                        scan::chunk_file(&root, &rel, &chunker, preserve_permissions)
                     })
                     .await
                     .context("chunk task panicked")??;
@@ -522,6 +559,20 @@ impl Engine {
         let response = self.client.ops_since(&self.config.folder_id, since).await?;
         for entry in response.entries {
             let path = decode_path(&entry.path).map_err(|_| anyhow!("server sent a bad path"))?;
+
+            // An excluded path is never applied, but the watermark must still
+            // move past it or every pull would replay it forever. This also
+            // protects against a legacy client that pushed an excluded path
+            // before the folder policy changed.
+            if self.ignore.matches(&path) {
+                let folder = folder.clone();
+                let seq = entry.seq;
+                self.store
+                    .blocking(move |conn| agent::set_applied_seq(conn, &folder, seq))
+                    .await?;
+                continue;
+            }
+
             let disk_path = self.config.root.join(scan::path_from_bytes(&path));
             let override_this =
                 ignore_holds && only_override_path.is_none_or(|target| target == path.as_slice());
@@ -569,8 +620,12 @@ impl Engine {
                     // matches the server's before overwriting it.
                     if !versions.contains_key(&path)
                         && disk_path.exists()
-                        && let Ok((local_meta, _)) =
-                            scan::chunk_file(&self.config.root, &path, &self.chunker)
+                        && let Ok((local_meta, _)) = scan::chunk_file(
+                            &self.config.root,
+                            &path,
+                            &self.chunker,
+                            self.config.preserve_permissions,
+                        )
                     {
                         let remote_meta = FileMeta {
                             size: entry.size,
@@ -683,6 +738,18 @@ async fn recv_control(control: &mut Option<mpsc::Receiver<FlushRequest>>) -> Opt
     }
 }
 
+/// The push baseline with excluded paths removed.
+///
+/// This is the fix for the delete trap: `changes` turns "in `last`, not in the
+/// scan" into a `Delete`. The scan already skips excluded paths, so the
+/// baseline must skip them too, or a folder that gains an exclude would delete
+/// every matching file on every other device.
+fn baseline_excluding(last: Manifest, ignore: &Ignore) -> Manifest {
+    last.into_iter()
+        .filter(|(path, _)| !ignore.matches(path))
+        .collect()
+}
+
 /// Turn the server's op-log stream into wake-ups for the pull loop.
 ///
 /// Running it as its own task keeps `run` a plain `select!`. It reconnects
@@ -773,7 +840,48 @@ fn advance_watermark(previous: i64, applied: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::advance_watermark;
+    use super::{advance_watermark, baseline_excluding};
+    use omni_core::{Change, ChunkRef, FileMeta, Ignore, Manifest, changes};
+
+    fn meta(label: &str) -> FileMeta {
+        FileMeta {
+            size: 3,
+            mtime_ns: 1,
+            mode: 0,
+            chunks: vec![ChunkRef::new(label, 3)],
+        }
+    }
+
+    #[test]
+    fn excluding_a_previously_synced_path_is_not_a_delete() {
+        let ignore = Ignore::vault_defaults();
+        let mut last = Manifest::new();
+        last.insert(b"notes/todo.md".to_vec(), meta("a"));
+        last.insert(b".obsidian/workspace.json".to_vec(), meta("b"));
+
+        // The scan skips the newly excluded file, but still sees the note.
+        let mut current = Manifest::new();
+        current.insert(b"notes/todo.md".to_vec(), meta("a"));
+
+        let diff = changes(&baseline_excluding(last, &ignore), &current);
+        assert!(
+            diff.is_empty(),
+            "an excluded path must not become a Delete, got {diff:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_removed_from_disk_is_still_a_delete() {
+        let ignore = Ignore::default();
+        let mut last = Manifest::new();
+        last.insert(b"notes/todo.md".to_vec(), meta("a"));
+
+        let diff = changes(&baseline_excluding(last, &ignore), &Manifest::new());
+        assert!(matches!(
+            diff.as_slice(),
+            [Change::Delete { path }] if path == b"notes/todo.md"
+        ));
+    }
 
     #[test]
     fn a_contiguous_batch_moves_the_watermark_to_its_end() {

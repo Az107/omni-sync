@@ -1,0 +1,10 @@
+{
+  "config": { "min": 65536, "avg": 262144, "max": 1048576 },
+  "cases": [
+    { "name": "splitmix64-2097152", "generator": "splitmix64", "len": 2097152, "seed": 1, "lens": [520198, 728729, 99909, 109515, 97019, 541782] },
+    { "name": "splitmix64-300000", "generator": "splitmix64", "len": 300000, "seed": 7, "lens": [112825, 187175] },
+    { "name": "ascii-ramp-1048576", "generator": "ascii-ramp", "len": 1048576, "seed": 0, "lens": [1048576] },
+    { "name": "text-1048576", "generator": "text", "len": 1048576, "seed": 0, "lens": [1048576] },
+    { "name": "ascii-noise-1048576", "generator": "ascii-noise", "len": 1048576, "seed": 3, "lens": [330429, 718147] }
+  ]
+}

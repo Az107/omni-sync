@@ -55,6 +55,17 @@ pub struct LogEntry {
     pub chunks: Vec<ChunkRef>,
 }
 
+/// A path whose file row is marked deleted, with the last content it had.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeletedFile {
+    pub path: PathBytes,
+    /// The newest version with content (`size > 0`) before the deletion.
+    pub version_id: i64,
+    pub size: u64,
+    /// RFC 3339 UTC, milliseconds, trailing `Z`.
+    pub deleted_at: String,
+}
+
 /// A stored version's content, used to restore a path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredVersion {
@@ -298,30 +309,52 @@ pub fn log_since(
     folder_id: &str,
     since: i64,
 ) -> Result<Vec<LogEntry>, StoreError> {
-    let mut stmt = conn.prepare(
+    Ok(log_since_limited(conn, folder_id, since, None)?.0)
+}
+
+/// The op log tail with the content each op produced, at most `limit` entries.
+///
+/// `limit == None` is the un-paginated tail every existing client gets: the
+/// whole log from `since`. With a limit the query fetches one row more than it
+/// returns, so `has_more` costs no second round trip. Returns
+/// `(entries, has_more)`.
+pub fn log_since_limited(
+    conn: &Connection,
+    folder_id: &str,
+    since: i64,
+    limit: Option<usize>,
+) -> Result<(Vec<LogEntry>, bool), StoreError> {
+    // `limit + 1` is what makes `has_more` answerable from this one query.
+    let bound = limit.map(|limit| limit.saturating_add(1) as i64);
+    let sql = if bound.is_some() {
         "SELECT o.id, v.id, o.kind, o.path, o.device_id, v.size, v.mtime_ns, v.mode, v.chunks_json
            FROM ops o
            JOIN versions v ON v.folder_id = o.folder_id AND v.seq = o.id
           WHERE o.folder_id = ?1 AND o.id > ?2
-          ORDER BY o.id",
-    )?;
-    let raw = stmt
-        .query_map(params![folder_id, since], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, PathBytes>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)? as u64,
-                row.get::<_, i64>(6)?,
-                row.get::<_, u32>(7)?,
-                row.get::<_, String>(8)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+          ORDER BY o.id
+          LIMIT ?3"
+    } else {
+        "SELECT o.id, v.id, o.kind, o.path, o.device_id, v.size, v.mtime_ns, v.mode, v.chunks_json
+           FROM ops o
+           JOIN versions v ON v.folder_id = o.folder_id AND v.seq = o.id
+          WHERE o.folder_id = ?1 AND o.id > ?2
+          ORDER BY o.id"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut raw = if let Some(bound) = bound {
+        stmt.query_map(params![folder_id, since, bound], log_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![folder_id, since], log_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
 
-    raw.into_iter()
+    let has_more = limit.is_some_and(|limit| raw.len() > limit);
+    if let Some(limit) = limit {
+        raw.truncate(limit);
+    }
+    let entries = raw
+        .into_iter()
         .map(
             |(seq, version_id, kind, path, device_id, size, mtime_ns, mode, chunks_json)| {
                 Ok(LogEntry {
@@ -337,7 +370,60 @@ pub fn log_since(
                 })
             },
         )
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok((entries, has_more))
+}
+
+/// One raw `log_since` row, before the chunk JSON is decoded.
+type RawLogRow = (i64, i64, String, PathBytes, String, u64, i64, u32, String);
+
+fn log_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawLogRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, i64>(1)?,
+        row.get::<_, String>(2)?,
+        row.get::<_, PathBytes>(3)?,
+        row.get::<_, String>(4)?,
+        row.get::<_, i64>(5)? as u64,
+        row.get::<_, i64>(6)?,
+        row.get::<_, u32>(7)?,
+        row.get::<_, String>(8)?,
+    ))
+}
+
+/// Every deleted path in a folder, newest deletion first.
+///
+/// One row per `files` row with `deleted_at` set. The version id is the most
+/// recent version with content (the last bytes before the delete), because a
+/// restore replays that content; paths that only ever held empty content have
+/// no such version and are skipped. A path re-created after its delete has
+/// `deleted_at = NULL` and so is not here at all.
+pub fn deleted_files(conn: &Connection, folder_id: &str) -> Result<Vec<DeletedFile>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT f.path, v.id, v.size, f.deleted_at
+           FROM files f
+           JOIN versions v ON v.id = (
+                SELECT id FROM versions
+                 WHERE folder_id = f.folder_id AND path = f.path AND size > 0
+                 ORDER BY id DESC
+                 LIMIT 1
+           )
+          WHERE f.folder_id = ?1 AND f.deleted_at IS NOT NULL
+          ORDER BY f.deleted_at DESC, f.path",
+    )?;
+    let rows = stmt.query_map([folder_id], |row| {
+        Ok(DeletedFile {
+            path: row.get::<_, PathBytes>(0)?,
+            version_id: row.get(1)?,
+            size: row.get::<_, i64>(2)? as u64,
+            deleted_at: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
 }
 
 /// Load one version's content (used to restore it).
@@ -574,6 +660,8 @@ mod tests {
             retention_versions: 50,
             retention_days: 90,
             encrypted: false,
+            exclude: Vec::new(),
+            preserve_permissions: true,
         };
         store.with(|conn| folders::create(conn, &folder)).unwrap();
         folder
@@ -699,5 +787,164 @@ mod tests {
         let tail = store.with(|conn| log_since(conn, "f1", 1)).unwrap();
         assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
         assert_eq!(tail[0].chunks, vec![ChunkRef::new("h1", 1)]);
+    }
+
+    #[test]
+    fn a_limited_log_tail_pages_and_reports_more() {
+        let store = Store::open_in_memory().unwrap();
+        folder(&store);
+        for i in 0..3 {
+            store
+                .with_mut(|conn| {
+                    apply_op(
+                        conn,
+                        "f1",
+                        "dev-1",
+                        &put_op(None, vec![ChunkRef::new(format!("h{i}"), 1)]),
+                    )
+                })
+                .unwrap();
+        }
+
+        // A page asks for one row more than it returns to answer `has_more`.
+        let (page, more) = store
+            .with(|conn| log_since_limited(conn, "f1", 0, Some(2)))
+            .unwrap();
+        assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(more);
+
+        // The follow-up page is short: the log is exhausted.
+        let (page, more) = store
+            .with(|conn| log_since_limited(conn, "f1", 2, Some(2)))
+            .unwrap();
+        assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![3]);
+        assert!(!more);
+
+        // No limit is the old un-paginated behaviour, and has_more is false.
+        let (page, more) = store
+            .with(|conn| log_since_limited(conn, "f1", 0, None))
+            .unwrap();
+        assert_eq!(page.len(), 3);
+        assert!(!more);
+
+        // An empty page still has no more to give.
+        let (page, more) = store
+            .with(|conn| log_since_limited(conn, "f1", 3, Some(10)))
+            .unwrap();
+        assert!(page.is_empty());
+        assert!(!more);
+    }
+
+    #[test]
+    fn deleted_files_carry_the_last_content_version() {
+        let store = Store::open_in_memory().unwrap();
+        folder(&store);
+
+        // Content, then an empty file that has nothing worth restoring.
+        let todo = store
+            .with_mut(|conn| {
+                apply_op(
+                    conn,
+                    "f1",
+                    "dev-1",
+                    &put_op(None, vec![ChunkRef::new("aa", 7)]),
+                )
+            })
+            .unwrap();
+        let other = store
+            .with_mut(|conn| {
+                apply_op(
+                    conn,
+                    "f1",
+                    "dev-1",
+                    &Op {
+                        path: b"notes/other.md".to_vec(),
+                        size: 3,
+                        ..put_op(None, vec![ChunkRef::new("cc", 3)])
+                    },
+                )
+            })
+            .unwrap();
+        let empty = store
+            .with_mut(|conn| {
+                apply_op(
+                    conn,
+                    "f1",
+                    "dev-1",
+                    &Op {
+                        path: b"empty.md".to_vec(),
+                        size: 0,
+                        ..put_op(None, Vec::new())
+                    },
+                )
+            })
+            .unwrap();
+
+        // Delete all three, then pin the delete times so ordering is
+        // deterministic (millisecond timestamps could otherwise tie).
+        for (seq, path) in [
+            (todo.seq, b"notes/todo.md".to_vec()),
+            (other.seq, b"notes/other.md".to_vec()),
+            (empty.seq, b"empty.md".to_vec()),
+        ] {
+            let delete = Op {
+                base_seq: seq,
+                base_version_id: Some(seq),
+                kind: OpKind::Delete,
+                path,
+                from: None,
+                size: 0,
+                mtime_ns: 0,
+                mode: 0,
+                chunks: Vec::new(),
+                restored_from: None,
+            };
+            store
+                .with_mut(|conn| apply_op(conn, "f1", "dev-1", &delete))
+                .unwrap();
+        }
+        store
+            .with(|conn| {
+                for (path, at) in [
+                    (&b"empty.md"[..], "2026-01-01T00:00:00.000Z"),
+                    (&b"notes/other.md"[..], "2026-01-15T00:00:00.000Z"),
+                    (&b"notes/todo.md"[..], "2026-02-01T00:00:00.000Z"),
+                ] {
+                    conn.execute(
+                        "UPDATE files SET deleted_at = ?2 WHERE path = ?1",
+                        params![path, at],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+
+        // `empty.md` had no content version, so it is skipped; the rest are
+        // newest deletion first and point at the put that held the bytes.
+        let deleted = store.with(|conn| deleted_files(conn, "f1")).unwrap();
+        assert_eq!(deleted.len(), 2);
+        assert_eq!(deleted[0].path, b"notes/todo.md");
+        assert_eq!(deleted[0].version_id, todo.version_id);
+        assert_eq!(deleted[0].size, 7);
+        assert_eq!(deleted[0].deleted_at, "2026-02-01T00:00:00.000Z");
+        assert_eq!(deleted[1].path, b"notes/other.md");
+        assert_eq!(deleted[1].version_id, other.version_id);
+        assert_eq!(deleted[1].size, 3);
+
+        // Re-creating the path clears `deleted_at`, so it leaves the trash;
+        // the other deleted path is untouched.
+        store
+            .with_mut(|conn| {
+                apply_op(
+                    conn,
+                    "f1",
+                    "dev-1",
+                    &put_op(None, vec![ChunkRef::new("bb", 3)]),
+                )
+            })
+            .unwrap();
+        let deleted = store.with(|conn| deleted_files(conn, "f1")).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].path, b"notes/other.md");
     }
 }

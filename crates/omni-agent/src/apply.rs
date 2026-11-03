@@ -37,7 +37,12 @@ pub fn write_file(root: &Path, rel: &[u8], bytes: &[u8], meta: &FileMeta) -> io:
     // Same directory as the target, so the rename stays within one filesystem.
     let tmp = temp_path(&path);
     fs::write(&tmp, bytes)?;
-    set_mode(&tmp, meta.mode)?;
+    // Mode 0 is the "this folder does not preserve permissions" sentinel: a
+    // client that cannot express POSIX modes (and every client of a vault
+    // folder) must leave the on-disk permissions alone.
+    if meta.mode != 0 {
+        set_mode(&tmp, meta.mode)?;
+    }
     // If the rename fails, do not leave the temp file behind.
     if let Err(error) = fs::rename(&tmp, &path) {
         let _ = fs::remove_file(&tmp);

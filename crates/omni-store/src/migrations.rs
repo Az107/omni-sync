@@ -15,6 +15,7 @@ use crate::StoreError;
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_baseline.sql"),
     include_str!("../migrations/0002_ops_base_version.sql"),
+    include_str!("../migrations/0003_folder_settings.sql"),
 ];
 
 /// Client (agent) schema versions, in order.

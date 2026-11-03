@@ -55,6 +55,9 @@ pub struct FolderView {
     pub state_kind: String,
     pub state_label: String,
     pub members: Vec<MemberView>,
+    /// Folder policy, shared by every client.
+    pub exclude: Vec<String>,
+    pub preserve_permissions: bool,
 }
 
 /// One device's hold on a folder, as the sync rail renders it.

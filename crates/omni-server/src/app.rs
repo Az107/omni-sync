@@ -8,18 +8,20 @@ use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use tokio::sync::broadcast;
+use tower_http::cors::CorsLayer;
 
 use omni_core::{Op, OpKind};
 use omni_netproto::{
-    AppliedOpDto, ChunkPutResponse, CreateFolderRequest, EnrollRequest, EnrollResponse, FolderDto,
-    FoldersResponse, HealthResponse, HistoryEntryDto, HistoryResponse, LogEntryDto,
-    ManifestEntryDto, ManifestResponse, MemberDto, MembersResponse, OpKindDto, OpsResponse,
-    OverwriteDto, PROTOCOL_VERSION, RegisterMemberRequest, ResolveRequest, SubmitOpsRequest,
-    SubmitOpsResponse,
+    AppliedOpDto, ChunkPutResponse, CreateFolderRequest, DeletedFileDto, DeletedFilesResponse,
+    DeviceDto, EnrollRequest, EnrollResponse, FolderDto, FoldersResponse, HeadResponse,
+    HealthResponse, HistoryEntryDto, HistoryResponse, LogEntryDto, ManifestEntryDto,
+    ManifestResponse, MemberDto, MembersResponse, OpKindDto, OpsResponse, OverwriteDto,
+    PROTOCOL_VERSION, RegisterMemberRequest, RenameDeviceRequest, ResolveRequest, SubmitOpsRequest,
+    SubmitOpsResponse, UpdateFolderRequest,
 };
 use omni_store::sync::{self, ActiveFile, LogEntry, OverwriteRow};
 use omni_store::{StoreError, devices, folders, members, pairing};
@@ -53,13 +55,16 @@ pub fn router(state: AppState) -> Router {
         .route("/devices", get(devices_page))
         .route("/devices/pair", post(devices_pair))
         .route("/folders", get(folders_page).post(folders_create))
+        .route("/folders/{id}/settings", post(folder_settings_update))
         .route("/overwrites", get(overwrites_page))
         .route("/overwrites/{id}/resolve", post(overwrite_resolve))
         .route("/overwrites/{id}/dismiss", post(overwrite_dismiss))
-        // Device enrollment.
+        // Device enrollment and self-management.
         .route("/api/v1/devices/enroll", post(enroll))
+        .route("/api/v1/devices/me", patch(rename_me).delete(revoke_me))
         // Folders.
         .route("/api/v1/folders", post(create_folder).get(list_folders))
+        .route("/api/v1/folders/{id}", patch(update_folder).get(get_folder))
         .route("/api/v1/folders/{id}/manifest", get(manifest))
         .route(
             "/api/v1/folders/{id}/members",
@@ -67,12 +72,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/folders/{id}/ops", post(submit_ops).get(list_ops))
         .route("/api/v1/folders/{id}/ops/stream", get(stream_ops))
+        .route("/api/v1/folders/{id}/head", get(get_folder_head))
+        .route("/api/v1/folders/{id}/deleted", get(list_deleted))
         .route("/api/v1/folders/{id}/history", get(history))
         .route("/api/v1/folders/{id}/resolve", post(resolve))
         .route("/api/v1/overwrites", get(list_overwrites))
+        .route("/api/v1/overwrites/{id}/dismiss", post(dismiss_overwrite))
         // Chunks.
         .route("/api/v1/chunks/{hash}", put(put_chunk).get(get_chunk))
         .with_state(state)
+        // CORS is permissive on purpose: the API authenticates with a bearer
+        // token in a header, never a cookie, so no cross-origin page can act as
+        // a logged-in user by riding ambient credentials (the dashboard cookie
+        // is SameSite=Strict and is not exposed by this layer). That leaves
+        // nothing to protect by origin allowlisting, while a browser/WebView
+        // client (the Obsidian plugin) may be served from `app://`, `file://`
+        // or a random dev port. Credentials stay off, so `*` is safe here.
+        .layer(CorsLayer::permissive())
 }
 
 /// Everything a handler can fail with.
@@ -300,17 +316,51 @@ async fn folders_create(
     }
     let name = form.name.trim();
     if !name.is_empty() {
-        let folder = folders::Folder {
-            id: uuid::Uuid::now_v7().to_string(),
-            name: name.to_string(),
-            retention_versions: 50,
-            retention_days: 90,
-            encrypted: false,
-        };
+        let folder = folders::Folder::new(uuid::Uuid::now_v7().to_string(), name.to_string());
         state
             .store
             .blocking(move |conn| folders::create(conn, &folder))
             .await?;
+    }
+    Ok(Redirect::to("/folders").into_response())
+}
+
+#[derive(Deserialize)]
+struct FolderSettingsForm {
+    #[serde(default)]
+    exclude: String,
+    /// Present only when the checkbox is ticked.
+    #[serde(default)]
+    preserve_permissions: Option<String>,
+}
+
+/// Save a folder's sync policy from the dashboard. The same fields are
+/// editable through `PATCH /api/v1/folders/{id}`, which is what clients use.
+async fn folder_settings_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+    Form(form): Form<FolderSettingsForm>,
+) -> Result<Response, AppError> {
+    if !session_ok(&state, &headers) {
+        return Ok(Redirect::to("/login").into_response());
+    }
+    let exclude: Vec<String> = form
+        .exclude
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let preserve = form.preserve_permissions.is_some();
+    let updated = state
+        .store
+        .blocking(move |conn| {
+            folders::update_settings(conn, &folder_id, Some(&exclude), Some(preserve))
+        })
+        .await?;
+    if !updated {
+        return Err(AppError::NotFound);
     }
     Ok(Redirect::to("/folders").into_response())
 }
@@ -612,6 +662,51 @@ async fn enroll(
     Ok(Json(EnrollResponse { device_id, token }))
 }
 
+/// `PATCH /api/v1/devices/me` — the calling device renames itself.
+async fn rename_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RenameDeviceRequest>,
+) -> Result<Json<DeviceDto>, AppError> {
+    let device = authenticate(&state, &headers).await?;
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err(AppError::BadRequest("a device name is required".into()));
+    }
+    let id = device.id.clone();
+    let new_name = name.to_string();
+    let renamed = state
+        .store
+        .blocking(move |conn| devices::rename(conn, &id, &new_name))
+        .await?;
+    if !renamed {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(DeviceDto {
+        id: device.id,
+        name: name.to_string(),
+    }))
+}
+
+/// `DELETE /api/v1/devices/me` — the calling device revokes its own token. The
+/// request authenticates with that token first, so a device cannot revoke
+/// another one.
+async fn revoke_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let device = authenticate(&state, &headers).await?;
+    let id = device.id;
+    let revoked = state
+        .store
+        .blocking(move |conn| devices::revoke(conn, &id))
+        .await?;
+    if !revoked {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---- auth helper -----------------------------------------------------------
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<devices::Device, AppError> {
@@ -654,19 +749,52 @@ async fn create_folder(
     if name.is_empty() {
         return Err(AppError::BadRequest("a folder name is required".into()));
     }
-    let folder = folders::Folder {
-        id: uuid::Uuid::now_v7().to_string(),
-        name: name.to_string(),
-        retention_versions: 50,
-        retention_days: 90,
-        encrypted: false,
-    };
+    if request.exclude.iter().any(|pattern| pattern.contains('\0')) {
+        return Err(AppError::BadRequest(
+            "an exclude pattern cannot contain a NUL".into(),
+        ));
+    }
+    let mut folder = folders::Folder::new(uuid::Uuid::now_v7().to_string(), name.to_string());
+    folder.exclude = request.exclude;
+    folder.preserve_permissions = request.preserve_permissions;
     let created = folder.clone();
     state
         .store
         .blocking(move |conn| folders::create(conn, &created))
         .await?;
     Ok(Json(folder_dto(&folder)))
+}
+
+/// Change a folder's sync policy. Excludes and the permission policy are folder
+/// properties, not device ones, so every client sees the same rule.
+async fn update_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+    Json(request): Json<UpdateFolderRequest>,
+) -> Result<Json<FolderDto>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    if let Some(patterns) = &request.exclude
+        && patterns.iter().any(|pattern| pattern.contains('\0'))
+    {
+        return Err(AppError::BadRequest(
+            "an exclude pattern cannot contain a NUL".into(),
+        ));
+    }
+    let exclude = request.exclude;
+    let preserve = request.preserve_permissions;
+    let id = folder_id.clone();
+    let updated = state
+        .store
+        .blocking(move |conn| {
+            if !folders::update_settings(conn, &id, exclude.as_deref(), preserve)? {
+                return Ok(None);
+            }
+            folders::get(conn, &id)
+        })
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(folder_dto(&updated)))
 }
 
 async fn list_folders(
@@ -678,6 +806,20 @@ async fn list_folders(
     Ok(Json(FoldersResponse {
         folders: folders.iter().map(folder_dto).collect(),
     }))
+}
+
+async fn get_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+) -> Result<Json<FolderDto>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    let folder = state
+        .store
+        .blocking(move |conn| folders::get(conn, &folder_id))
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(folder_dto(&folder)))
 }
 
 /// A device registers (or moves) its root for a folder.
@@ -762,9 +904,11 @@ async fn submit_ops(
         });
         if let Some(overwrite) = result.overwrite {
             overwrites.push(OverwriteDto {
+                id: None,
                 path: dto.path.clone(),
                 losing_version_id: overwrite.losing_version_id,
                 winning_version_id: overwrite.winning_version_id,
+                folder_id: Some(folder_id.clone()),
             });
         }
     }
@@ -846,33 +990,90 @@ struct SinceQuery {
     since: i64,
 }
 
+/// The op-log page size a `limit` is clamped into. The cap keeps one request
+/// from loading a whole large folder's history into memory; a client that hits
+/// it just pulls again with the returned `next`.
+const MAX_OPS_PAGE: usize = 2000;
+
+#[derive(Deserialize)]
+struct OpsQuery {
+    #[serde(default)]
+    since: i64,
+    /// Absent means "the whole tail", which is what the Rust client asks for.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 async fn list_ops(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(folder_id): Path<String>,
-    Query(query): Query<SinceQuery>,
+    Query(query): Query<OpsQuery>,
 ) -> Result<Json<OpsResponse>, AppError> {
     let device = authenticate(&state, &headers).await?;
     let since = query.since;
+    // A limit below 1 is treated as 1 rather than rejected: asking for "at
+    // least one op" is the only sensible reading of `limit=0`.
+    let limit = query.limit.map(|limit| limit.clamp(1, MAX_OPS_PAGE));
     let lookup = folder_id.clone();
-    let entries = state
+    let (entries, has_more) = state
         .store
-        .blocking(move |conn| sync::log_since(conn, &lookup, since))
+        .blocking(move |conn| sync::log_since_limited(conn, &lookup, since, limit))
         .await?;
 
     // A pull also tells us how far this device has caught up: it will apply
     // everything returned, so its watermark becomes the last seq (or its
     // `since` when nothing is new). This is what the dashboard's rail shows.
-    let acked = entries.last().map(|entry| entry.seq).unwrap_or(since);
+    let next = entries.last().map(|entry| entry.seq).unwrap_or(since);
     let folder = folder_id.clone();
     let device_id = device.id.clone();
     state
         .store
-        .blocking(move |conn| members::set_acked(conn, &folder, &device_id, acked))
+        .blocking(move |conn| members::set_acked(conn, &folder, &device_id, next))
         .await?;
 
     Ok(Json(OpsResponse {
         entries: entries.into_iter().map(log_dto).collect(),
+        next,
+        has_more,
+    }))
+}
+
+/// `GET /api/v1/folders/{id}/head` — the newest op id, 0 when the log is empty.
+/// The paginated client polls this cheaply instead of fetching a whole page.
+async fn get_folder_head(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+) -> Result<Json<HeadResponse>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    let head = folder_head(&state, &folder_id).await?;
+    Ok(Json(HeadResponse { head }))
+}
+
+/// `GET /api/v1/folders/{id}/deleted` — the trash: every path whose file row is
+/// marked deleted, newest first, each with the last content version before the
+/// delete so the client can restore it through `/resolve`.
+async fn list_deleted(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(folder_id): Path<String>,
+) -> Result<Json<DeletedFilesResponse>, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    let files = state
+        .store
+        .blocking(move |conn| sync::deleted_files(conn, &folder_id))
+        .await?;
+    Ok(Json(DeletedFilesResponse {
+        files: files
+            .into_iter()
+            .map(|file| DeletedFileDto {
+                path: omni_netproto::encode_path(&file.path),
+                version_id: file.version_id,
+                size: file.size,
+                deleted_at: file.deleted_at,
+            })
+            .collect(),
     }))
 }
 
@@ -888,6 +1089,21 @@ async fn list_overwrites(
         .blocking(move |conn| sync::overwrites_since(conn, true, since))
         .await?;
     Ok(Json(rows.into_iter().map(overwrite_dto).collect()))
+}
+
+/// Mark an overwrite review row as "keep the active version" without touching
+/// any content. The dashboard has the same action as a form post.
+async fn dismiss_overwrite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    let _device = authenticate(&state, &headers).await?;
+    state
+        .store
+        .blocking(move |conn| sync::mark_overwrite_resolved(conn, id))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -1019,6 +1235,8 @@ fn folder_dto(folder: &folders::Folder) -> FolderDto {
     FolderDto {
         id: folder.id.clone(),
         name: folder.name.clone(),
+        exclude: folder.exclude.clone(),
+        preserve_permissions: folder.preserve_permissions,
     }
 }
 
@@ -1068,9 +1286,11 @@ fn kind_dto(kind: &str) -> OpKindDto {
 
 fn overwrite_dto(row: OverwriteRow) -> OverwriteDto {
     OverwriteDto {
+        id: Some(row.id),
         path: omni_netproto::encode_path(&row.path),
         losing_version_id: row.losing_version_id,
         winning_version_id: row.winning_version_id,
+        folder_id: Some(row.folder_id),
     }
 }
 
@@ -1111,6 +1331,8 @@ async fn folder_views(state: &AppState) -> Result<Vec<FolderView>, AppError> {
             state_kind: state_kind.to_string(),
             state_label,
             members: member_views,
+            exclude: folder.exclude,
+            preserve_permissions: folder.preserve_permissions,
         });
     }
     Ok(views)
@@ -1423,5 +1645,66 @@ mod tests {
         let view = member_view(member(10), 10);
         assert_eq!(view.pct, 100);
         assert_eq!(view.lag, 0);
+    }
+
+    /// Build a router over a throwaway in-memory store, for in-process requests.
+    fn test_router() -> Router {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().join("data"),
+            state_dir: dir.path().join("state"),
+            dashboard_password_hash: String::new(),
+        };
+        router(AppState::new(
+            omni_store::Store::open_in_memory().unwrap(),
+            config,
+        ))
+    }
+
+    #[tokio::test]
+    async fn a_preflight_for_a_chunk_put_is_allowed() {
+        use axum::body::Body;
+        use axum::http::{Method, Request};
+        use tower::ServiceExt as _;
+
+        // What a browser sends before a cross-origin `PUT /api/v1/chunks/<hash>`.
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/v1/chunks/abc")
+            .header(header::ORIGIN, "http://localhost:8080")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization,content-type",
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let response = test_router().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .unwrap(),
+            "*"
+        );
+        let methods = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .expect("a preflight must allow methods")
+            .to_str()
+            .unwrap();
+        // tower-http mirrors the requested method for `Any`; `*` is its other
+        // valid rendering. Either way PUT must be permitted.
+        assert!(methods == "*" || methods.contains("PUT"), "got {methods:?}");
+        // The API is token-authenticated; ambient credentials must stay off.
+        assert!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+                .is_none()
+        );
     }
 }
