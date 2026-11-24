@@ -9,12 +9,14 @@ description = "The omni-sync client daemon: watcher, holds and apply"
 
 [dependencies]
 anyhow.workspace = true
+cap-std = "3"
 notify.workspace = true
 omni-chunk.workspace = true
 omni-core.workspace = true
 omni-netproto.workspace = true
 omni-store.workspace = true
 omni-transfer.workspace = true
+rand.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

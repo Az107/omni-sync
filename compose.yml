@@ -22,6 +22,10 @@ services:
       OMNI_SYNC_ADDR: "0.0.0.0:80"
       OMNI_SYNC_DATA_DIR: "/data"
       OMNI_SYNC_STATE_DIR: "/state"
+      # Set to 1 only if direct access is blocked and the trusted TLS proxy
+      # overwrites X-Forwarded-Proto and appends the verified source IP to
+      # X-Forwarded-For; HTTPS dashboard cookies then use Secure.
+      OMNI_SYNC_TRUST_FORWARDED_PROTO: "${OMNI_SYNC_TRUST_FORWARDED_PROTO:-0}"
       # Only needed if the GitHub repo is private, for `omni-sync-server
       # update` to read the release. The repo is public, so this is unset.
       OMNI_SYNC_GITHUB_TOKEN: "${OMNI_SYNC_GITHUB_TOKEN:-}"

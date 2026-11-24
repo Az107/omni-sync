@@ -4,6 +4,7 @@
 //! client should never sync (its own temp files, editor droppings) are skipped
 //! here, so they never enter a diff.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -34,15 +35,62 @@ pub struct ScanOptions {
 /// re-verify would close that hole at the price of reading the whole tree; it is
 /// deliberately not wired into the steady-state loop, and belongs in an
 /// explicit `omni verify` command instead.
+#[cfg(test)]
 pub fn scan(
     root: &Path,
     chunker: &Chunker,
     previous: &Manifest,
     options: ScanOptions,
 ) -> io::Result<Manifest> {
-    let mut manifest = Manifest::new();
-    walk(root, root, chunker, previous, &options, &mut manifest)?;
-    Ok(manifest)
+    Ok(scan_with_deferred(root, chunker, previous, options)?.manifest)
+}
+
+pub struct ScanResult {
+    pub manifest: Manifest,
+    pub deferred: BTreeSet<PathBytes>,
+}
+
+impl ScanResult {
+    pub fn is_deferred(&self, path: &[u8]) -> bool {
+        self.deferred.iter().any(|prefix| {
+            prefix.is_empty()
+                || path == prefix.as_slice()
+                || (path.starts_with(prefix) && path.get(prefix.len()) == Some(&b'/'))
+        })
+    }
+
+    fn defer(&mut self, path: &[u8], error: impl std::fmt::Display) {
+        tracing::warn!(path = ?path, %error, "deferring local path; other files will still sync");
+        self.deferred.insert(path.to_vec());
+    }
+}
+
+pub fn scan_with_deferred(
+    root: &Path,
+    chunker: &Chunker,
+    previous: &Manifest,
+    options: ScanOptions,
+) -> io::Result<ScanResult> {
+    let dir = cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority())?;
+    let mut result = ScanResult {
+        manifest: Manifest::new(),
+        deferred: BTreeSet::new(),
+    };
+    walk(
+        root,
+        Path::new(""),
+        &dir,
+        chunker,
+        previous,
+        &options,
+        &mut result,
+    );
+    let deferred = std::mem::take(&mut result.manifest)
+        .into_iter()
+        .filter(|(path, _)| !result.is_deferred(path))
+        .collect();
+    result.manifest = deferred;
+    Ok(result)
 }
 
 /// Read one file, chunk and hash it. Returns the metadata and the chunk bytes,
@@ -53,9 +101,27 @@ pub fn chunk_file(
     chunker: &Chunker,
     preserve_permissions: bool,
 ) -> io::Result<(FileMeta, Vec<HashedChunk>)> {
-    let path = root.join(path_from_bytes(rel));
-    let bytes = fs::read(&path)?;
-    let meta = fs::metadata(&path)?;
+    use std::io::Read as _;
+    let mut file = crate::apply::open_file(root, rel)?;
+    let before = file.metadata()?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let meta = file.metadata()?;
+    if before.len() != meta.len()
+        || before.modified()? != meta.modified()?
+        || bytes.len() as u64 != meta.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file changed while reading",
+        ));
+    }
 
     let hashed = chunker.chunk_and_hash(&bytes);
     let chunks: Vec<ChunkRef> = hashed
@@ -75,30 +141,68 @@ pub fn chunk_file(
 #[allow(clippy::too_many_arguments)]
 fn walk(
     root: &Path,
-    dir: &Path,
+    relative_dir: &Path,
+    dir: &cap_std::fs::Dir,
     chunker: &Chunker,
     previous: &Manifest,
     options: &ScanOptions,
-    manifest: &mut Manifest,
-) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    result: &mut ScanResult,
+) {
+    let entries = match dir.entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            result.defer(&path_bytes(relative_dir), error);
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                result.defer(&path_bytes(relative_dir), error);
+                continue;
+            }
+        };
         let name = entry.file_name();
         if is_ignored(&name.to_string_lossy()) {
             continue;
         }
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        let rel = path.strip_prefix(root).unwrap_or(&path);
-        let rel_bytes = path_bytes(rel);
+        let rel = relative_dir.join(&name);
+        let rel_bytes = path_bytes(&rel);
         if options.ignore.matches(&rel_bytes) {
             continue;
         }
+        if let Err(error) = crate::apply::validate_rel(&rel_bytes) {
+            result.defer(&rel_bytes, error);
+            continue;
+        }
+        #[cfg(windows)]
+        if path_from_bytes(&rel_bytes) != rel {
+            result.defer(&rel_bytes, "unrepresentable local path");
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                result.defer(&rel_bytes, error);
+                continue;
+            }
+        };
 
         if file_type.is_dir() {
-            walk(root, &path, chunker, previous, options, manifest)?;
+            match dir.open_dir(&name) {
+                Ok(child) => walk(root, &rel, &child, chunker, previous, options, result),
+                Err(error) => result.defer(&rel_bytes, error),
+            }
         } else if file_type.is_file() {
-            let meta = fs::metadata(&path)?;
+            let meta = match crate::apply::metadata(root, &rel_bytes) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    result.defer(&rel_bytes, error);
+                    continue;
+                }
+            };
             let mtime = mtime_ns(&meta);
             let mode = mode(&meta, options.preserve_permissions);
 
@@ -109,30 +213,20 @@ fn walk(
                 && known.mtime_ns == mtime
                 && known.mode == mode
             {
-                manifest.insert(rel_bytes, known.clone());
+                result.manifest.insert(rel_bytes, known.clone());
                 continue;
             }
 
-            let bytes = fs::read(&path)?;
-            let chunks: Vec<ChunkRef> = chunker
-                .chunk_and_hash(&bytes)
-                .into_iter()
-                .map(|chunk| ChunkRef::new(chunk.hash, chunk.len))
-                .collect();
-            manifest.insert(
-                rel_bytes,
-                FileMeta {
-                    size: bytes.len() as u64,
-                    mtime_ns: mtime,
-                    mode,
-                    chunks,
-                },
-            );
+            match chunk_file(root, &rel_bytes, chunker, options.preserve_permissions) {
+                Ok((meta, _)) => {
+                    result.manifest.insert(rel_bytes, meta);
+                }
+                Err(error) => result.defer(&rel_bytes, error),
+            }
         }
         // Symlinks and other special files are skipped: following them risks
         // loops and syncing things outside the root.
     }
-    Ok(())
 }
 
 /// Names the client never syncs.
@@ -210,6 +304,31 @@ mod tests {
             ignore: ignore.clone(),
             preserve_permissions,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_names_defer_only_their_own_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("12:30.txt"), b"unsupported").unwrap();
+        fs::write(root.path().join("good.txt"), b"valid").unwrap();
+        let result = scan_with_deferred(
+            root.path(),
+            &Chunker::new(Config::small()),
+            &Manifest::new(),
+            options(&Ignore::default(), true),
+        )
+        .unwrap();
+        assert!(result.manifest.contains_key(b"good.txt".as_slice()));
+        assert!(result.is_deferred(b"12:30.txt"));
+        assert!(!result.is_deferred(b"good.txt"));
+        let mut last = result.manifest.clone();
+        last.insert(
+            b"12:30.txt".to_vec(),
+            last.get(b"good.txt".as_slice()).unwrap().clone(),
+        );
+        last.retain(|path, _| !result.is_deferred(path));
+        assert!(omni_core::changes(&last, &result.manifest).is_empty());
     }
 
     #[test]

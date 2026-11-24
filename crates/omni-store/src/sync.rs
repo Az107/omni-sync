@@ -8,10 +8,162 @@
 //!
 //! Chunk refcounts are bumped for anything the version references.
 
+use std::collections::HashMap;
+
 use omni_core::{ChunkRef, Decision, Op, OpKind, PathBytes, Sequencer};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::StoreError;
+
+/// The longest path a client may submit. `PATH_MAX` on Linux is 4096 bytes
+/// including the NUL, and a relative path under a watched root is never longer.
+pub const MAX_PATH_BYTES: usize = 4096;
+
+/// The largest single chunk the relay will accept or reference. The default
+/// chunker caps at 1 MiB; this leaves room for a deliberately larger
+/// configuration without letting a client claim an unbounded length.
+pub const MAX_CHUNK_LEN: u64 = 64 * 1024 * 1024;
+
+/// The most chunk refs one op may carry. The HTTP body limit is far smaller,
+/// but a store-level bound keeps a hand-crafted op from exhausting memory.
+pub const MAX_CHUNKS_PER_OP: usize = 1_048_576;
+
+/// Is `hash` exactly 64 lowercase hex characters (the wire and storage shape of
+/// a SHA-256 chunk id)?
+pub fn is_valid_chunk_hash(hash: &str) -> bool {
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Validate a path as it arrives from a client.
+///
+/// Paths are relative to the folder root and always `/`-separated. This mirrors
+/// the receiving clients' rule (and `omni_core::validate_relative_path`), so
+/// the server cannot accept a path a client would reject on apply: non-empty,
+/// relative, no NUL, no backslash or colon (a Windows separator, drive prefix
+/// or alternate-data-stream alias), and no empty, `.` or `..` segment. This
+/// layer adds the [`MAX_PATH_BYTES`] bound.
+///
+/// This is syntax validation, not filesystem confinement: the client must still
+/// apply relative to an opened directory so a symlink cannot escape the root.
+pub fn validate_path(path: &[u8]) -> Result<(), StoreError> {
+    if path.len() > MAX_PATH_BYTES {
+        return Err(StoreError::InvalidOp(format!(
+            "path is longer than {MAX_PATH_BYTES} bytes"
+        )));
+    }
+    omni_core::validate_relative_path(path)
+        .map_err(|error| StoreError::InvalidOp(error.to_string()))
+}
+
+/// Validate an op's shape before it can be committed: its path(s), the chunk
+/// hash format, and metadata that must agree with the chunk list.
+pub fn validate_op(op: &Op) -> Result<(), StoreError> {
+    validate_path(&op.path)?;
+    if op.kind == OpKind::Move {
+        let from = op
+            .from
+            .as_deref()
+            .ok_or_else(|| StoreError::InvalidOp("a move op requires a source path".into()))?;
+        validate_path(from)?;
+    }
+    if op.kind == OpKind::Resolve && op.restored_from.is_none() {
+        return Err(StoreError::InvalidOp(
+            "a resolve op requires restored_from".into(),
+        ));
+    }
+    if matches!(op.kind, OpKind::Put | OpKind::Resolve) {
+        validate_content(op.size, &op.chunks)?;
+    }
+    Ok(())
+}
+
+fn validate_content(size: u64, chunks: &[ChunkRef]) -> Result<(), StoreError> {
+    if size > i64::MAX as u64 {
+        return Err(StoreError::InvalidOp("file size exceeds i64::MAX".into()));
+    }
+    if chunks.len() > MAX_CHUNKS_PER_OP {
+        return Err(StoreError::InvalidOp(format!(
+            "more than {MAX_CHUNKS_PER_OP} chunks in one op"
+        )));
+    }
+    let mut total: u64 = 0;
+    for chunk in chunks {
+        if !is_valid_chunk_hash(&chunk.hash) {
+            return Err(StoreError::InvalidOp(format!(
+                "chunk hash {:?} is not 64 lowercase hex characters",
+                chunk.hash
+            )));
+        }
+        if chunk.len == 0 || chunk.len > MAX_CHUNK_LEN {
+            return Err(StoreError::InvalidOp(format!(
+                "chunk {} has an out-of-range length {}",
+                chunk.hash, chunk.len
+            )));
+        }
+        total = total
+            .checked_add(chunk.len)
+            .ok_or_else(|| StoreError::InvalidOp("chunk lengths overflow".into()))?;
+        if total > i64::MAX as u64 {
+            return Err(StoreError::InvalidOp("file size exceeds i64::MAX".into()));
+        }
+    }
+    if total != size {
+        return Err(StoreError::InvalidOp(format!(
+            "chunk lengths total {total} but the op claims size {size}"
+        )));
+    }
+    Ok(())
+}
+
+/// The stored sizes of the chunks named by `hashes`, keyed by hash. A hash that
+/// has no row is absent from the map, which the caller treats as missing.
+pub fn chunk_sizes(
+    conn: &Connection,
+    hashes: &[String],
+) -> Result<HashMap<String, u64>, StoreError> {
+    let mut stmt = conn.prepare("SELECT size FROM chunks WHERE hash = ?1")?;
+    let mut sizes = HashMap::with_capacity(hashes.len());
+    for hash in hashes {
+        let size: Option<i64> = stmt.query_row([hash], |row| row.get(0)).optional()?;
+        if let Some(size) = size {
+            sizes.insert(hash.clone(), size as u64);
+        }
+    }
+    Ok(sizes)
+}
+
+/// Reject an op that references a chunk row that does not exist or whose
+/// recorded length disagrees with the op. The bytes on disk are verified by the
+/// HTTP layer, which is the only layer that owns the chunk store.
+fn check_chunk_rows(conn: &Connection, op: &Op) -> Result<(), StoreError> {
+    // A delete's content fields are ignored by the commit path, so they must
+    // not be able to fail validation either.
+    if op.kind == OpKind::Delete || op.chunks.is_empty() {
+        return Ok(());
+    }
+    let hashes: Vec<String> = op.chunks.iter().map(|chunk| chunk.hash.clone()).collect();
+    let sizes = chunk_sizes(conn, &hashes)?;
+    for chunk in &op.chunks {
+        match sizes.get(&chunk.hash) {
+            None => {
+                return Err(StoreError::MissingChunk {
+                    hash: chunk.hash.clone(),
+                });
+            }
+            Some(size) if *size != chunk.len => {
+                return Err(StoreError::InvalidOp(format!(
+                    "chunk {} is stored with length {size}, op claims {}",
+                    chunk.hash, chunk.len
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
 
 /// The result of applying one op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,6 +222,9 @@ pub struct DeletedFile {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredVersion {
     pub id: i64,
+    /// The folder the version was committed to. A restore must never pull
+    /// content from another folder's history.
+    pub folder_id: String,
     pub path: PathBytes,
     pub size: u64,
     pub mtime_ns: i64,
@@ -136,15 +291,83 @@ pub fn apply_op(
     device_id: &str,
     op: &Op,
 ) -> Result<AppliedOp, StoreError> {
-    if op.kind == OpKind::Move {
-        // Move is delete+put at the client until it is implemented here.
-        return Err(StoreError::Unsupported(
-            "move ops are not implemented yet".to_string(),
-        ));
+    let mut applied = apply_ops(conn, folder_id, device_id, std::slice::from_ref(op))?;
+    applied
+        .pop()
+        .ok_or_else(|| StoreError::InvalidOp("no op to apply".into()))
+}
+
+/// Apply a whole submitted batch in **one** transaction.
+///
+/// Every op is validated before the transaction opens, and every chunk a
+/// version references is checked inside it. If any op is invalid or any chunk
+/// is missing, the transaction is dropped and *nothing* from the batch is
+/// committed — a client can retry the same batch after fixing the offending op
+/// without having to reason about a half-applied prefix.
+pub fn apply_ops(
+    conn: &mut Connection,
+    folder_id: &str,
+    device_id: &str,
+    ops: &[Op],
+) -> Result<Vec<AppliedOp>, StoreError> {
+    if ops.is_empty() {
+        return Ok(Vec::new());
+    }
+    for op in ops {
+        validate_op(op)?;
+        if op.kind == OpKind::Move {
+            // Move is delete+put at the client until it is implemented here.
+            return Err(StoreError::Unsupported(
+                "move ops are not implemented yet".to_string(),
+            ));
+        }
     }
 
     let tx = conn.transaction()?;
+    let mut applied = Vec::with_capacity(ops.len());
+    for op in ops {
+        check_resolve_source(&tx, folder_id, op)?;
+        check_chunk_rows(&tx, op)?;
+        applied.push(apply_one(&tx, folder_id, device_id, op)?);
+    }
+    tx.commit()?;
+    Ok(applied)
+}
 
+/// A resolve may only name a version from the folder it is being applied to.
+/// This keeps the API's restore path and a hand-submitted `resolve` op to the
+/// same rule.
+fn check_resolve_source(conn: &Connection, folder_id: &str, op: &Op) -> Result<(), StoreError> {
+    if op.kind != OpKind::Resolve {
+        return Ok(());
+    }
+    let Some(source) = op.restored_from else {
+        return Ok(());
+    };
+    let source_folder: Option<String> = conn
+        .query_row(
+            "SELECT folder_id FROM versions WHERE id = ?1",
+            [source],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match source_folder {
+        Some(source_folder) if source_folder == folder_id => Ok(()),
+        Some(_) => Err(StoreError::InvalidOp(format!(
+            "version {source} belongs to another folder"
+        ))),
+        None => Err(StoreError::InvalidOp(format!(
+            "unknown restored_from version {source}"
+        ))),
+    }
+}
+
+fn apply_one(
+    tx: &Transaction<'_>,
+    folder_id: &str,
+    device_id: &str,
+    op: &Op,
+) -> Result<AppliedOp, StoreError> {
     let chunks_json =
         serde_json::to_string(&op.chunks).map_err(|e| StoreError::Json(e.to_string()))?;
 
@@ -209,8 +432,10 @@ pub fn apply_op(
         params![folder_id, op.path, version_id, is_delete],
     )?;
 
-    for chunk in &op.chunks {
-        add_chunk_ref(&tx, &chunk.hash, chunk.len)?;
+    if !is_delete {
+        for chunk in &op.chunks {
+            add_chunk_ref(tx, &chunk.hash, chunk.len)?;
+        }
     }
 
     let overwrite = match decision {
@@ -230,7 +455,6 @@ pub fn apply_op(
         _ => None,
     };
 
-    tx.commit()?;
     Ok(AppliedOp {
         seq,
         version_id,
@@ -240,6 +464,7 @@ pub fn apply_op(
 
 /// Record that a version references a chunk (create the row, or bump `refs`).
 pub fn add_chunk_ref(conn: &Connection, hash: &str, size: u64) -> Result<(), StoreError> {
+    check_chunk_metadata(hash, size)?;
     conn.execute(
         "INSERT INTO chunks (hash, size, refs) VALUES (?1, ?2, 1)
          ON CONFLICT (hash) DO UPDATE SET refs = refs + 1",
@@ -250,11 +475,24 @@ pub fn add_chunk_ref(conn: &Connection, hash: &str, size: u64) -> Result<(), Sto
 
 /// Note that a chunk's bytes are on disk, without claiming a reference yet.
 pub fn ensure_chunk_row(conn: &Connection, hash: &str, size: u64) -> Result<(), StoreError> {
+    check_chunk_metadata(hash, size)?;
     conn.execute(
         "INSERT INTO chunks (hash, size, refs) VALUES (?1, ?2, 0)
          ON CONFLICT (hash) DO NOTHING",
         params![hash, size as i64],
     )?;
+    Ok(())
+}
+
+fn check_chunk_metadata(hash: &str, size: u64) -> Result<(), StoreError> {
+    if !is_valid_chunk_hash(hash) {
+        return Err(StoreError::InvalidOp(format!(
+            "chunk hash {hash:?} is not 64 lowercase hex characters"
+        )));
+    }
+    if size > i64::MAX as u64 {
+        return Err(StoreError::InvalidOp("chunk size exceeds i64::MAX".into()));
+    }
     Ok(())
 }
 
@@ -430,24 +668,27 @@ pub fn deleted_files(conn: &Connection, folder_id: &str) -> Result<Vec<DeletedFi
 pub fn version(conn: &Connection, version_id: i64) -> Result<Option<StoredVersion>, StoreError> {
     let row = conn
         .query_row(
-            "SELECT id, path, size, mtime_ns, mode, chunks_json FROM versions WHERE id = ?1",
+            "SELECT id, folder_id, path, size, mtime_ns, mode, chunks_json
+               FROM versions WHERE id = ?1",
             [version_id],
             |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, PathBytes>(1)?,
-                    row.get::<_, i64>(2)? as u64,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, u32>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, PathBytes>(2)?,
+                    row.get::<_, i64>(3)? as u64,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, u32>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             },
         )
         .optional()?;
 
     match row {
-        Some((id, path, size, mtime_ns, mode, chunks_json)) => Ok(Some(StoredVersion {
+        Some((id, folder_id, path, size, mtime_ns, mode, chunks_json)) => Ok(Some(StoredVersion {
             id,
+            folder_id,
             path,
             size,
             mtime_ns,
@@ -667,6 +908,26 @@ mod tests {
         folder
     }
 
+    /// A valid 64-character lowercase-hex hash derived from one byte.
+    fn chunk_hash(byte: u8) -> String {
+        format!("{byte:02x}").repeat(32)
+    }
+
+    fn chunk(byte: u8, len: u64) -> ChunkRef {
+        ChunkRef::new(chunk_hash(byte), len)
+    }
+
+    fn seed_chunks(store: &Store, chunks: &[ChunkRef]) {
+        store
+            .with(|conn| {
+                for chunk in chunks {
+                    ensure_chunk_row(conn, &chunk.hash, chunk.len)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     fn put_op(base_version_id: Option<i64>, chunks: Vec<ChunkRef>) -> Op {
         Op {
             base_seq: 0,
@@ -682,15 +943,18 @@ mod tests {
         }
     }
 
+    fn apply(store: &Store, device: &str, op: &Op) -> Result<AppliedOp, StoreError> {
+        seed_chunks(store, &op.chunks);
+        store.with_mut(|conn| apply_op(conn, "f1", device, op))
+    }
+
     #[test]
     fn a_first_put_creates_the_file_and_refs_its_chunks() {
         let store = Store::open_in_memory().unwrap();
         folder(&store);
-        let chunks = vec![ChunkRef::new("aa", 10), ChunkRef::new("bb", 5)];
+        let chunks = vec![chunk(b'a', 10), chunk(b'b', 5)];
 
-        let applied = store
-            .with_mut(|conn| apply_op(conn, "f1", "dev-1", &put_op(None, chunks.clone())))
-            .unwrap();
+        let applied = apply(&store, "dev-1", &put_op(None, chunks.clone())).unwrap();
         assert_eq!(applied.seq, 1);
         assert!(applied.overwrite.is_none());
 
@@ -699,10 +963,11 @@ mod tests {
         assert_eq!(manifest[0].path, b"notes/todo.md");
         assert_eq!(manifest[0].chunks, chunks);
 
+        let hash = chunk_hash(b'a');
         let refs: i64 = store
             .with(|conn| {
                 Ok(
-                    conn.query_row("SELECT refs FROM chunks WHERE hash = 'aa'", [], |r| {
+                    conn.query_row("SELECT refs FROM chunks WHERE hash = ?1", [&hash], |r| {
                         r.get(0)
                     })?,
                 )
@@ -716,27 +981,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         folder(&store);
 
-        let first = store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-a",
-                    &put_op(None, vec![ChunkRef::new("aa", 1)]),
-                )
-            })
-            .unwrap();
-        let second = store
-            .with_mut(|conn| {
-                // dev-b edits without having seen dev-a's version (base = None).
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-b",
-                    &put_op(None, vec![ChunkRef::new("cc", 1)]),
-                )
-            })
-            .unwrap();
+        let first = apply(&store, "dev-a", &put_op(None, vec![chunk(b'a', 1)])).unwrap();
+        // dev-b edits without having seen dev-a's version (base = None).
+        let second = apply(&store, "dev-b", &put_op(None, vec![chunk(b'c', 1)])).unwrap();
 
         let overwrite = second.overwrite.expect("a stale base must be flagged");
         assert_eq!(overwrite.losing_version_id, first.version_id);
@@ -750,21 +997,10 @@ mod tests {
     fn a_delete_removes_the_path_from_the_manifest() {
         let store = Store::open_in_memory().unwrap();
         folder(&store);
-        let applied = store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-1",
-                    &put_op(None, vec![ChunkRef::new("aa", 1)]),
-                )
-            })
-            .unwrap();
+        let applied = apply(&store, "dev-1", &put_op(None, vec![chunk(b'a', 1)])).unwrap();
         let mut delete = put_op(Some(applied.seq), vec![]);
         delete.kind = OpKind::Delete;
-        store
-            .with_mut(|conn| apply_op(conn, "f1", "dev-1", &delete))
-            .unwrap();
+        apply(&store, "dev-1", &delete).unwrap();
         assert!(store.with(|conn| manifest(conn, "f1")).unwrap().is_empty());
     }
 
@@ -773,20 +1009,12 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         folder(&store);
         for i in 0..3 {
-            store
-                .with_mut(|conn| {
-                    apply_op(
-                        conn,
-                        "f1",
-                        "dev-1",
-                        &put_op(None, vec![ChunkRef::new(format!("h{i}"), 1)]),
-                    )
-                })
-                .unwrap();
+            let op = put_op(None, vec![chunk(i + 1, 1)]);
+            apply(&store, "dev-1", &op).unwrap();
         }
         let tail = store.with(|conn| log_since(conn, "f1", 1)).unwrap();
         assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2, 3]);
-        assert_eq!(tail[0].chunks, vec![ChunkRef::new("h1", 1)]);
+        assert_eq!(tail[0].chunks, vec![chunk(2, 1)]);
     }
 
     #[test]
@@ -794,16 +1022,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         folder(&store);
         for i in 0..3 {
-            store
-                .with_mut(|conn| {
-                    apply_op(
-                        conn,
-                        "f1",
-                        "dev-1",
-                        &put_op(None, vec![ChunkRef::new(format!("h{i}"), 1)]),
-                    )
-                })
-                .unwrap();
+            let op = put_op(None, vec![chunk(i + 1, 1)]);
+            apply(&store, "dev-1", &op).unwrap();
         }
 
         // A page asks for one row more than it returns to answer `has_more`.
@@ -841,44 +1061,27 @@ mod tests {
         folder(&store);
 
         // Content, then an empty file that has nothing worth restoring.
-        let todo = store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-1",
-                    &put_op(None, vec![ChunkRef::new("aa", 7)]),
-                )
-            })
-            .unwrap();
-        let other = store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-1",
-                    &Op {
-                        path: b"notes/other.md".to_vec(),
-                        size: 3,
-                        ..put_op(None, vec![ChunkRef::new("cc", 3)])
-                    },
-                )
-            })
-            .unwrap();
-        let empty = store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-1",
-                    &Op {
-                        path: b"empty.md".to_vec(),
-                        size: 0,
-                        ..put_op(None, Vec::new())
-                    },
-                )
-            })
-            .unwrap();
+        let todo = apply(&store, "dev-1", &put_op(None, vec![chunk(b'a', 7)])).unwrap();
+        let other = apply(
+            &store,
+            "dev-1",
+            &Op {
+                path: b"notes/other.md".to_vec(),
+                size: 3,
+                ..put_op(None, vec![chunk(b'c', 3)])
+            },
+        )
+        .unwrap();
+        let empty = apply(
+            &store,
+            "dev-1",
+            &Op {
+                path: b"empty.md".to_vec(),
+                size: 0,
+                ..put_op(None, Vec::new())
+            },
+        )
+        .unwrap();
 
         // Delete all three, then pin the delete times so ordering is
         // deterministic (millisecond timestamps could otherwise tie).
@@ -899,9 +1102,7 @@ mod tests {
                 chunks: Vec::new(),
                 restored_from: None,
             };
-            store
-                .with_mut(|conn| apply_op(conn, "f1", "dev-1", &delete))
-                .unwrap();
+            apply(&store, "dev-1", &delete).unwrap();
         }
         store
             .with(|conn| {
@@ -933,18 +1134,157 @@ mod tests {
 
         // Re-creating the path clears `deleted_at`, so it leaves the trash;
         // the other deleted path is untouched.
-        store
-            .with_mut(|conn| {
-                apply_op(
-                    conn,
-                    "f1",
-                    "dev-1",
-                    &put_op(None, vec![ChunkRef::new("bb", 3)]),
-                )
-            })
-            .unwrap();
+        apply(&store, "dev-1", &put_op(None, vec![chunk(b'b', 3)])).unwrap();
         let deleted = store.with(|conn| deleted_files(conn, "f1")).unwrap();
         assert_eq!(deleted.len(), 1);
         assert_eq!(deleted[0].path, b"notes/other.md");
+    }
+
+    #[test]
+    fn paths_are_relative_and_well_formed() {
+        for valid in [
+            &b"notes/todo.md"[..],
+            b"r\xc3\xa9sum\xc3\xa9.pdf",
+            b"dir with spaces/file.txt",
+            b".hidden",
+        ] {
+            validate_path(valid)
+                .unwrap_or_else(|e| panic!("{:?}: {e}", String::from_utf8_lossy(valid)));
+        }
+
+        for invalid in [
+            &b""[..],
+            b"/etc/passwd",
+            b"../escape",
+            b"notes/../../escape",
+            b"notes/./todo.md",
+            b"notes//todo.md",
+            b"notes/",
+            b"notes\\todo.md",
+            b"\\\\server\\share",
+            b"C:evil",
+            b"C:\\Windows\\evil",
+            b"dir/file:stream",
+            b"nul\\0byte",
+        ] {
+            assert!(
+                validate_path(invalid).is_err(),
+                "should reject {:?}",
+                String::from_utf8_lossy(invalid)
+            );
+        }
+
+        // The length bound is enforced, not just the shape.
+        let too_long = vec![b'a'; MAX_PATH_BYTES + 1];
+        assert!(validate_path(&too_long).is_err());
+    }
+
+    #[test]
+    fn op_metadata_must_match_its_chunks() {
+        // A well-formed op passes.
+        validate_op(&put_op(None, vec![chunk(b'a', 5), chunk(b'b', 7)])).unwrap();
+
+        // A short, uppercase or non-hex hash is refused.
+        for hash in ["aa".to_string(), "AA".repeat(32), "zz".repeat(32)] {
+            let op = put_op(None, vec![ChunkRef::new(hash, 1)]);
+            assert!(matches!(validate_op(&op), Err(StoreError::InvalidOp(_))));
+        }
+
+        // Chunk lengths must total the claimed size.
+        let mut mismatched = put_op(None, vec![chunk(b'a', 5)]);
+        mismatched.size = 4;
+        assert!(matches!(
+            validate_op(&mismatched),
+            Err(StoreError::InvalidOp(_))
+        ));
+
+        // A zero-length or over-large chunk is refused.
+        for len in [0, MAX_CHUNK_LEN + 1] {
+            let op = put_op(None, vec![chunk(b'a', len)]);
+            assert!(matches!(validate_op(&op), Err(StoreError::InvalidOp(_))));
+        }
+
+        // A delete only needs a valid path; its content fields are ignored.
+        let mut delete = put_op(None, vec![]);
+        delete.kind = OpKind::Delete;
+        validate_op(&delete).unwrap();
+
+        // A resolve must name the version it restores.
+        let mut resolve = put_op(None, vec![]);
+        resolve.kind = OpKind::Resolve;
+        assert!(matches!(
+            validate_op(&resolve),
+            Err(StoreError::InvalidOp(_))
+        ));
+    }
+
+    #[test]
+    fn a_missing_chunk_is_rejected_and_nothing_commits() {
+        let store = Store::open_in_memory().unwrap();
+        folder(&store);
+        // Deliberately do not seed the chunk row.
+        let op = put_op(None, vec![chunk(b'a', 1)]);
+        let error = store
+            .with_mut(|conn| apply_op(conn, "f1", "dev-1", &op))
+            .unwrap_err();
+        assert!(matches!(error, StoreError::MissingChunk { .. }));
+        assert_eq!(store.with(|conn| folder_head(conn, "f1")).unwrap(), 0);
+        assert!(store.with(|conn| manifest(conn, "f1")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resolve_cannot_reference_another_folders_version() {
+        let store = Store::open_in_memory().unwrap();
+        folder(&store);
+        store
+            .with(|conn| folders::create(conn, &folders::Folder::new("f2", "Other")))
+            .unwrap();
+        let source = apply(&store, "dev-1", &put_op(None, vec![chunk(b'a', 1)])).unwrap();
+        seed_chunks(&store, &[chunk(b'a', 1)]);
+
+        let resolve = Op {
+            base_seq: 0,
+            base_version_id: None,
+            kind: OpKind::Resolve,
+            path: b"b.txt".to_vec(),
+            from: None,
+            size: 1,
+            mtime_ns: 1,
+            mode: 0o644,
+            chunks: vec![chunk(b'a', 1)],
+            restored_from: Some(source.version_id),
+        };
+        let error = store
+            .with_mut(|conn| apply_op(conn, "f2", "dev-1", &resolve))
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidOp(_)));
+        assert_eq!(store.with(|conn| folder_head(conn, "f2")).unwrap(), 0);
+
+        // The same op in the owning folder is fine.
+        store
+            .with_mut(|conn| apply_op(conn, "f1", "dev-1", &resolve))
+            .unwrap();
+        assert_eq!(store.with(|conn| folder_head(conn, "f1")).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_batch_with_one_bad_op_commits_nothing() {
+        let store = Store::open_in_memory().unwrap();
+        folder(&store);
+        seed_chunks(&store, &[chunk(b'a', 1)]);
+
+        let good = put_op(None, vec![chunk(b'a', 1)]);
+        let missing = Op {
+            path: b"notes/second.md".to_vec(),
+            ..put_op(None, vec![chunk(b'z', 1)])
+        };
+        let error = store
+            .with_mut(|conn| apply_ops(conn, "f1", "dev-1", &[good, missing]))
+            .unwrap_err();
+        assert!(matches!(error, StoreError::MissingChunk { .. }));
+
+        // The first op must not have been committed either.
+        assert_eq!(store.with(|conn| folder_head(conn, "f1")).unwrap(), 0);
+        assert!(store.with(|conn| manifest(conn, "f1")).unwrap().is_empty());
     }
 }

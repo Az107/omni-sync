@@ -256,7 +256,11 @@ async fn serve(
         .await
         .with_context(|| format!("binding {addr}"))?;
     tracing::info!(%addr, "omni-sync-server listening; TLS terminates at the proxy");
-    axum::serve(listener, app::router(state)).await?;
+    axum::serve(
+        listener,
+        app::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

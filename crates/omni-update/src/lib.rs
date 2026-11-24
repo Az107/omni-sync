@@ -16,7 +16,9 @@
 //! (minisign/sigstore) is the natural next step and would slot in beside
 //! [`verify`].
 
-use std::path::Path;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use semver::Version;
 use serde::Deserialize;
@@ -122,6 +124,12 @@ struct ReleaseJson {
     html_url: String,
     #[serde(default)]
     assets: Vec<AssetJson>,
+    /// GitHub's API exposes these flags; a default (unpinned) update must not
+    /// install an unpublished or pre-release build.
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
 #[derive(Deserialize)]
@@ -132,11 +140,38 @@ struct AssetJson {
 
 const USER_AGENT: &str = concat!("omni-sync-updater/", env!("CARGO_PKG_VERSION"));
 
-fn http() -> reqwest::Client {
-    reqwest::Client::builder()
+/// A black-holed route must not hang `update` before it even prints a plan.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Release metadata is tiny, but the asset download shares this client; ten
+/// minutes is a finite ceiling for a slow link without failing a normal binary.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+/// Error bodies are diagnostic only.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
+fn http() -> Result<reqwest::Client, UpdateError> {
+    Ok(reqwest::Client::builder()
         .user_agent(USER_AGENT)
-        .build()
-        .unwrap_or_default()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
+
+/// Read an error body with a hard cap.
+async fn text_bounded(mut response: reqwest::Response) -> String {
+    let mut out = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let remaining = MAX_ERROR_BODY.saturating_sub(out.len());
+        if chunk.len() > remaining {
+            out.extend_from_slice(&chunk[..remaining]);
+            out.extend_from_slice(b"...");
+            break;
+        }
+        out.extend_from_slice(&chunk);
+        if out.len() == MAX_ERROR_BODY {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn token_from_env() -> Option<String> {
@@ -160,29 +195,44 @@ pub async fn release(binary: &str, tag: Option<&str>) -> Result<Release, UpdateE
         None => {
             let url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
             let list: Vec<ReleaseJson> = fetch_json(&url).await?;
-            let prefix = tag_prefix(binary);
-            let mut newest: Option<Release> = None;
-            for json in list {
-                if !json.tag_name.starts_with(prefix) {
-                    continue;
-                }
-                let Ok(candidate) = parse_release(json) else {
-                    continue;
-                };
-                if newest
-                    .as_ref()
-                    .is_none_or(|best| candidate.version > best.version)
-                {
-                    newest = Some(candidate);
-                }
-            }
-            newest.ok_or(UpdateError::NoRelease)
+            // The default update path is the stable train: drafts and
+            // pre-releases are skipped. Pinning a tag with `--to` still
+            // installs exactly what was asked for.
+            select_newest(list, tag_prefix(binary), false).ok_or(UpdateError::NoRelease)
         }
     }
 }
 
+/// Pick the newest release on `prefix`'s tag train. Pure, so the draft /
+/// pre-release filter is unit-tested without the network.
+fn select_newest(
+    list: Vec<ReleaseJson>,
+    prefix: &str,
+    include_prereleases: bool,
+) -> Option<Release> {
+    let mut newest: Option<Release> = None;
+    for json in list {
+        if !json.tag_name.starts_with(prefix) {
+            continue;
+        }
+        if !include_prereleases && (json.draft || json.prerelease) {
+            continue;
+        }
+        let Ok(candidate) = parse_release(json) else {
+            continue;
+        };
+        if newest
+            .as_ref()
+            .is_none_or(|best| candidate.version > best.version)
+        {
+            newest = Some(candidate);
+        }
+    }
+    newest
+}
+
 async fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, UpdateError> {
-    let mut request = http()
+    let mut request = http()?
         .get(url)
         .header(reqwest::header::ACCEPT, "application/vnd.github+json");
     if let Some(token) = token_from_env() {
@@ -196,7 +246,7 @@ async fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, Upda
     if !status.is_success() {
         return Err(UpdateError::Status {
             status: status.as_u16(),
-            body: response.text().await.unwrap_or_default(),
+            body: text_bounded(response).await,
         });
     }
     Ok(response.json().await?)
@@ -298,7 +348,7 @@ pub async fn apply(plan: &Plan, destination: &Path) -> Result<(), UpdateError> {
 }
 
 async fn fetch(asset: &Asset) -> Result<Vec<u8>, UpdateError> {
-    let mut request = http().get(&asset.url);
+    let mut request = http()?.get(&asset.url);
     if let Some(token) = token_from_env() {
         request = request.bearer_auth(token);
     }
@@ -307,7 +357,7 @@ async fn fetch(asset: &Asset) -> Result<Vec<u8>, UpdateError> {
     if !status.is_success() {
         return Err(UpdateError::Status {
             status: status.as_u16(),
-            body: response.text().await.unwrap_or_default(),
+            body: text_bounded(response).await,
         });
     }
     Ok(response.bytes().await?.to_vec())
@@ -350,33 +400,152 @@ pub fn verify(
 
 /// Replace `destination` with `bytes`, atomically where the platform allows.
 ///
+/// The new bytes go into an exclusively-created, uniquely-named staging file in
+/// the destination directory, are fsynced, and only then renamed into place. A
+/// fixed staging name would let two concurrent updaters clobber each other's
+/// half-written binary; `create_new` also refuses to follow a pre-existing
+/// symlink.
+///
 /// A running process keeps the old inode after the unix rename, so installing
 /// over a running binary is safe; the new one takes effect on the next start.
 /// Windows cannot rename over a running executable, so the current file is
-/// moved aside first (a stale `.old` is cleaned up on the next update).
+/// moved aside first and restored if the final rename fails. A missing
+/// destination is normal (first install) and is not an error.
 pub fn install(destination: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
-    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    let parent = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let filename = destination
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("omni-sync");
-    let staging = parent.join(format!(".{filename}.new"));
 
-    std::fs::write(&staging, bytes)?;
+    let (staging, mut file) = create_staging(parent, filename)?;
+    let written = (|| -> Result<(), UpdateError> {
+        file.write_all(bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(0o755))?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&staging);
+        return Err(error);
+    }
+
+    let result = install_staged(&staging, destination, parent, filename);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    result
+}
+
+/// Create a unique staging sibling. `RandomState` is seeded from the OS, so the
+/// name is not predictable, and `create_new` makes the open exclusive.
+fn create_staging(parent: &Path, filename: &str) -> Result<(PathBuf, std::fs::File), UpdateError> {
+    use std::hash::{BuildHasher as _, Hasher as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let random = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    for attempt in 0..16u32 {
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{filename}.new.{}.{nanos:x}.{random:x}.{unique}.{attempt}",
+            std::process::id()
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            // Private until the bytes are verified and the executable mode is
+            // applied, so another user cannot read a half-written binary.
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique update staging file",
+    )
+    .into())
+}
+
+#[cfg(not(windows))]
+fn install_staged(
+    staging: &Path,
+    destination: &Path,
+    _parent: &Path,
+    _filename: &str,
+) -> Result<(), UpdateError> {
+    std::fs::rename(staging, destination)?;
+    // Best-effort directory fsync so the rename survives a power loss. Some
+    // filesystems reject opening/fsyncing a directory; the install already
+    // succeeded, so that is not worth failing over.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
+    if let Ok(directory) = std::fs::File::open(_parent) {
+        let _ = directory.sync_all();
     }
-
-    #[cfg(windows)]
-    {
-        let old = parent.join(format!(".{filename}.old"));
-        let _ = std::fs::remove_file(&old);
-        std::fs::rename(destination, &old)?;
-    }
-    std::fs::rename(&staging, destination)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn install_staged(
+    staging: &Path,
+    destination: &Path,
+    parent: &Path,
+    filename: &str,
+) -> Result<(), UpdateError> {
+    // Each updater owns its own backup. A fixed `.old` name lets concurrent
+    // updates delete each other's rollback copy (or an unrelated user file).
+    let (old, reserved) = create_staging(parent, &format!("{filename}.old"))?;
+    drop(reserved);
+    std::fs::remove_file(&old)?;
+    let moved_aside = match std::fs::rename(destination, &old) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+
+    match std::fs::rename(staging, destination) {
+        Ok(()) => {
+            if moved_aside {
+                let _ = std::fs::remove_file(&old);
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // Put the old binary back so a failed install never leaves the
+            // user without a working executable.
+            if moved_aside
+                && !destination.exists()
+                && let Err(restore_error) = std::fs::rename(&old, destination)
+            {
+                return Err(std::io::Error::new(error.kind(), format!(
+                    "install failed: {error}; rollback failed: {restore_error}; previous binary is at {}",
+                    old.display()
+                )).into());
+            }
+            Err(error.into())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +638,38 @@ mod tests {
         );
     }
 
+    fn release_json(tag: &str, draft: bool, prerelease: bool) -> ReleaseJson {
+        ReleaseJson {
+            tag_name: tag.to_string(),
+            html_url: String::new(),
+            assets: Vec::new(),
+            draft,
+            prerelease,
+        }
+    }
+
+    #[test]
+    fn default_updates_skip_drafts_and_prereleases() {
+        let list = vec![
+            release_json("client-v0.5.0", false, true),
+            release_json("client-v9.9.9", true, false),
+            release_json("client-v0.4.9", false, false),
+            release_json("server-v9.0.0", false, false),
+        ];
+        let selected = select_newest(list, "client-v", false).unwrap();
+        assert_eq!(selected.version.to_string(), "0.4.9");
+    }
+
+    #[test]
+    fn explicitly_including_prereleases_can_pick_one() {
+        let list = vec![
+            release_json("client-v0.5.0", false, true),
+            release_json("client-v0.4.9", false, false),
+        ];
+        let selected = select_newest(list, "client-v", true).unwrap();
+        assert_eq!(selected.version.to_string(), "0.5.0");
+    }
+
     #[test]
     fn install_replaces_a_file_and_marks_it_executable() {
         let dir = tempfile::tempdir().unwrap();
@@ -482,5 +683,48 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o111, 0o111, "the binary must stay executable");
         }
+        // The uniquely-named staging file was renamed away, not left behind.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("omni-sync")]);
+    }
+
+    #[test]
+    fn install_creates_a_missing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omni-sync");
+        assert!(!path.exists());
+        install(&path, b"first install").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first install");
+    }
+
+    #[test]
+    fn installation_does_not_delete_an_unowned_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("omni-sync");
+        let unowned = dir.path().join(".omni-sync.old");
+        std::fs::write(&path, b"previous").unwrap();
+        std::fs::write(&unowned, b"unrelated user data").unwrap();
+        install(&path, b"updated").unwrap();
+        assert_eq!(std::fs::read(unowned).unwrap(), b"unrelated user data");
+    }
+
+    #[test]
+    fn staging_files_are_unique_and_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _first_file) = create_staging(dir.path(), "omni-sync").unwrap();
+        let (second, _second_file) = create_staging(dir.path(), "omni-sync").unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+        // A second create at the same path must fail rather than reuse it.
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&first)
+                .is_err()
+        );
     }
 }

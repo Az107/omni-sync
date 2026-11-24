@@ -17,11 +17,14 @@ use omni_agent::{Engine, FlushRequest, path_bytes};
 use omni_store::Store;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader,
+};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
+use crate::lock::{InstanceLock, LockError, busy_message};
 use crate::{ClientConfig, WatchEntry, agent_db_path, engine_config, load_config, write_private};
 
 const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -29,6 +32,22 @@ const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// the permission policy are folder properties, so a dashboard/plugin edit must
 /// reach every client without a restart.
 const FOLDER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A loopback control client gets this long to send its one-line request.
+/// Without it an idle connection could park the daemon's accept loop — and
+/// therefore its shutdown path — indefinitely.
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// A control reply is a tiny JSON object; a timeout bounds a peer that stops
+/// reading.
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A flush may legitimately take a while (a large first sync), so the reply
+/// deadline is generous. It still keeps the CLI from hanging forever.
+const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bound both directions: an unauthenticated local process must not be able to
+/// make the daemon allocate without limit.
+const MAX_CONTROL_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_REPLY_BYTES: usize = 16 * 1024;
 
 /// What changed between the currently running folder set and a newly loaded
 /// config. Pure, so it is unit-tested in isolation.
@@ -267,6 +286,95 @@ pub fn control_file_path(config_path: &Path) -> PathBuf {
     dir.join(format!("{stem}.daemon.ctl"))
 }
 
+/// Read one newline-terminated control line without letting a peer grow the
+/// buffer past `max` bytes. `None` means EOF before any byte.
+async fn read_line_bounded<R>(reader: &mut R, max: usize) -> std::io::Result<Option<String>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    // `take` bounds the *read*, so a peer that never sends a newline cannot
+    // allocate without limit; the extra byte detects "exactly max + 1".
+    let mut limited = reader.take(max as u64 + 1);
+    let read = limited.read_line(&mut line).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control line too large",
+        ));
+    }
+    Ok(Some(line))
+}
+
+fn encode_control_request(request: &ControlWireRequest) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(request)?;
+    if bytes.len() > MAX_CONTROL_REQUEST_BYTES {
+        bail!(
+            "control request is too large ({} bytes, limit {MAX_CONTROL_REQUEST_BYTES})",
+            bytes.len()
+        );
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn validate_control_request(
+    raw: &str,
+    expected_token: &str,
+) -> std::result::Result<ControlWireRequest, String> {
+    // `raw` still carries the newline `read_line` included; the cap is on the
+    // JSON payload, so exclude line endings before comparing.
+    let payload = raw.trim_end_matches(&['\r', '\n'][..]);
+    if payload.len() > MAX_CONTROL_REQUEST_BYTES {
+        return Err("control request too large".to_string());
+    }
+    match serde_json::from_str::<ControlWireRequest>(payload) {
+        Ok(request) if request.token == expected_token => Ok(request),
+        Ok(_) => Err("unauthorized control request".to_string()),
+        Err(error) => Err(format!("bad control request: {error}")),
+    }
+}
+
+/// Serialise a reply and enforce the reply cap. An error string from a failed
+/// sync can be arbitrarily long, so it is replaced with a short bounded error
+/// rather than sent raw.
+fn encode_control_reply(reply: ControlWireResponse) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&reply).unwrap_or_default();
+    if bytes.len() > MAX_CONTROL_REPLY_BYTES {
+        bytes = serde_json::to_vec(&ControlWireResponse {
+            ok: false,
+            synced: 0,
+            error: Some("control reply too large".to_string()),
+        })
+        .unwrap_or_default();
+    }
+    bytes.push(b'\n');
+    bytes
+}
+
+async fn send_control_reply(stream: &mut TcpStream, reply: ControlWireResponse) {
+    let bytes = encode_control_reply(reply);
+    let _ = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, async {
+        stream.write_all(&bytes).await?;
+        stream.shutdown().await
+    })
+    .await;
+}
+
+/// Remove the control file only if it still holds *our* contents. A daemon
+/// starting after us may already have replaced it, and removing that would
+/// strand its clients.
+fn remove_control_file_if_unchanged(path: &Path, expected: &str) {
+    if let Ok(current) = std::fs::read_to_string(path)
+        && current == expected
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Send a command to the running daemon for `config_path`, if one is alive.
 /// Returns `Ok(None)` when no daemon is running so the caller can fall back to
 /// an in-process one-shot run.
@@ -281,9 +389,13 @@ pub async fn try_send_command(
     let Ok(info) = serde_json::from_str::<ControlInfo>(&raw) else {
         return Ok(None);
     };
-    let Ok(mut stream) = TcpStream::connect(&info.addr).await else {
-        // Stale control file from a killed daemon.
-        let _ = std::fs::remove_file(&ctl_path);
+
+    // A stale file from a killed daemon is left in place on purpose: deleting
+    // it races a daemon that starts and rewrites the file between our read and
+    // unlink, and a harmless dead address costs only one failed connect.
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(CONTROL_CONNECT_TIMEOUT, TcpStream::connect(&info.addr)).await
+    else {
         return Ok(None);
     };
 
@@ -291,14 +403,39 @@ pub async fn try_send_command(
         token: info.token,
         command,
     };
-    let mut payload = serde_json::to_vec(&wire)?;
-    payload.push(b'\n');
-    stream.write_all(&payload).await?;
-    stream.shutdown().await?;
+    let payload = encode_control_request(&wire)?;
+    let wrote = tokio::time::timeout(CONTROL_WRITE_TIMEOUT, async {
+        stream.write_all(&payload).await?;
+        stream.shutdown().await
+    })
+    .await;
+    if !matches!(wrote, Ok(Ok(()))) {
+        // The daemon may have died mid-write; let the caller fall back. If it
+        // is actually alive, the lock it holds makes that fallback fail safely.
+        return Ok(None);
+    }
 
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let reply = tokio::time::timeout(
+        CONTROL_REPLY_TIMEOUT,
+        read_line_bounded(&mut reader, MAX_CONTROL_REPLY_BYTES),
+    )
+    .await;
+    let line = match reply {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => {
+            return Err(anyhow!(
+                "daemon closed the control connection without replying"
+            ));
+        }
+        Ok(Err(error)) => return Err(error.into()),
+        Err(_) => {
+            return Err(anyhow!(
+                "timed out after {}s waiting for the daemon control reply",
+                CONTROL_REPLY_TIMEOUT.as_secs()
+            ));
+        }
+    };
     if line.trim().is_empty() {
         return Err(anyhow!(
             "daemon closed the control connection without replying"
@@ -306,12 +443,15 @@ pub async fn try_send_command(
     }
     let response: ControlWireResponse = serde_json::from_str(&line)?;
     if !response.ok {
-        bail!(
-            "{}",
-            response
-                .error
-                .unwrap_or_else(|| "daemon refused the command".to_string())
-        );
+        let error = response
+            .error
+            .unwrap_or_else(|| "daemon refused the command".to_string());
+        // A different daemon (or a stale port) means "no daemon for this
+        // config"; the caller may safely try to claim the lock itself.
+        if error == "unauthorized control request" {
+            return Ok(None);
+        }
+        bail!("{error}");
     }
     Ok(Some(response.synced))
 }
@@ -352,6 +492,14 @@ impl Shutdown {
 /// Run the client daemon until Ctrl-C or SIGTERM, watching `config_path` for
 /// changes and serving `add` / `flush` requests on the local control socket.
 pub async fn run(config_path: &Path) -> Result<()> {
+    // Own the config/database before opening the store or starting any engine.
+    // The kernel releases this on exit, so a crashed daemon needs no stale-lock
+    // recovery, and a second daemon (or a one-shot CLI engine) fails fast.
+    let _instance_lock = InstanceLock::try_acquire(config_path).map_err(|error| match error {
+        LockError::Busy => anyhow!("{}", busy_message(config_path)),
+        LockError::Io(error) => anyhow!(error).context("taking the client instance lock"),
+    })?;
+
     let initial = load_config(config_path)?;
     let store = Store::open_agent(&agent_db_path(config_path))?;
     let mut manager = FolderManager::new(store);
@@ -382,7 +530,18 @@ pub async fn run(config_path: &Path) -> Result<()> {
     refresh.tick().await;
 
     let mut last_raw = std::fs::read_to_string(config_path).unwrap_or_default();
-    let mut shutdown = Shutdown::new()?;
+
+    // Turn the signal into a broadcast value so both the outer loop and an
+    // in-flight control request can observe it without borrowing the same
+    // receiver twice.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut signal = Shutdown::new()?;
+    let shutdown_task = tokio::spawn(async move {
+        signal.recv().await;
+        let _ = shutdown_tx.send(true);
+    });
+    let mut shutdown_outer = shutdown_rx.clone();
+    let mut shutdown_inner = shutdown_rx;
 
     println!(
         "omni-sync daemon: {} folder(s); watching for changes, streaming the op log",
@@ -392,19 +551,24 @@ pub async fn run(config_path: &Path) -> Result<()> {
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.recv() => {
+            _ = shutdown_outer.changed() => {
                 break;
             }
             accepted = listener.accept() => {
                 if let Ok((stream, _)) = accepted {
-                    handle_control_client(
-                        stream,
-                        &token,
-                        config_path,
-                        &mut last_raw,
-                        &mut manager,
-                    )
-                    .await;
+                    // A control request can take a while (a real sync). Watch
+                    // shutdown here too, so SIGTERM does not wait for a slow
+                    // client; all its I/O is separately time-bounded.
+                    tokio::select! {
+                        _ = shutdown_inner.changed() => break,
+                        _ = handle_control_client(
+                            stream,
+                            &token,
+                            config_path,
+                            &mut last_raw,
+                            &mut manager,
+                        ) => {}
+                    }
                 }
             }
             Some(()) = config_events.recv() => {
@@ -426,8 +590,11 @@ pub async fn run(config_path: &Path) -> Result<()> {
         }
     }
 
+    shutdown_task.abort();
     manager.stop_all();
-    let _ = std::fs::remove_file(&ctl_path);
+    // Only remove the file if it is still ours; never unlink a newer daemon's
+    // control information.
+    remove_control_file_if_unchanged(&ctl_path, &ctl_json);
     Ok(())
 }
 
@@ -459,62 +626,68 @@ async fn handle_control_client(
     manager: &mut FolderManager,
 ) {
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    if reader.read_line(&mut line).await.is_err() {
-        return;
-    }
+    let read = tokio::time::timeout(
+        CONTROL_READ_TIMEOUT,
+        read_line_bounded(&mut reader, MAX_CONTROL_REQUEST_BYTES),
+    )
+    .await;
     let mut stream = reader.into_inner();
 
-    let reply = match serde_json::from_str::<ControlWireRequest>(&line) {
-        Ok(req) if req.token == expected_token => {
-            // Always pick up any latest config edits first.
-            if let Ok(raw) = std::fs::read_to_string(config_path)
-                && let Ok(config) = toml::from_str::<ClientConfig>(&raw)
-            {
-                *last_raw = raw;
-                let _ = manager.reconcile(&config).await;
-            }
+    let reply = match read {
+        Ok(Ok(Some(line))) => match validate_control_request(&line, expected_token) {
+            Ok(request) => {
+                // Always pick up any latest config edits first.
+                if let Ok(raw) = std::fs::read_to_string(config_path)
+                    && let Ok(config) = toml::from_str::<ClientConfig>(&raw)
+                {
+                    *last_raw = raw;
+                    let _ = manager.reconcile(&config).await;
+                }
 
-            let outcome = match req.command {
-                ControlCommand::ReloadAndSync { folder_id } => {
-                    manager.trigger(folder_id.as_deref(), None, false).await
+                let outcome = match request.command {
+                    ControlCommand::ReloadAndSync { folder_id } => {
+                        manager.trigger(folder_id.as_deref(), None, false).await
+                    }
+                    ControlCommand::Flush { folder, path } => {
+                        manager
+                            .trigger(folder.as_deref(), path.as_deref(), true)
+                            .await
+                    }
+                };
+                match outcome {
+                    Ok(synced) => ControlWireResponse {
+                        ok: true,
+                        synced,
+                        error: None,
+                    },
+                    Err(error) => ControlWireResponse {
+                        ok: false,
+                        synced: 0,
+                        error: Some(error.to_string()),
+                    },
                 }
-                ControlCommand::Flush { folder, path } => {
-                    manager
-                        .trigger(folder.as_deref(), path.as_deref(), true)
-                        .await
-                }
-            };
-            match outcome {
-                Ok(synced) => ControlWireResponse {
-                    ok: true,
-                    synced,
-                    error: None,
-                },
-                Err(error) => ControlWireResponse {
-                    ok: false,
-                    synced: 0,
-                    error: Some(error.to_string()),
-                },
             }
-        }
-        Ok(_) => ControlWireResponse {
-            ok: false,
-            synced: 0,
-            error: Some("unauthorized control request".to_string()),
+            Err(error) => ControlWireResponse {
+                ok: false,
+                synced: 0,
+                error: Some(error),
+            },
         },
-        Err(error) => ControlWireResponse {
+        // A peer that connected and said nothing (or disconnected) is simply
+        // dropped; it must never hold the accept loop or shutdown open.
+        Ok(Ok(None)) | Err(_) => return,
+        Ok(Err(error)) => ControlWireResponse {
             ok: false,
             synced: 0,
-            error: Some(format!("bad control request: {error}")),
+            error: Some(if error.kind() == std::io::ErrorKind::InvalidData {
+                "control request too large".to_string()
+            } else {
+                format!("reading control request: {error}")
+            }),
         },
     };
 
-    if let Ok(mut bytes) = serde_json::to_vec(&reply) {
-        bytes.push(b'\n');
-        let _ = stream.write_all(&bytes).await;
-        let _ = stream.shutdown().await;
-    }
+    send_control_reply(&mut stream, reply).await;
 }
 
 /// Watch the directory containing `config_path` so write-then-rename updates
@@ -601,5 +774,75 @@ mod tests {
         let diff = diff_folders(&running, &desired);
         assert!(diff.to_stop.is_empty());
         assert_eq!(diff.to_start, vec![entry("f1", "/new", "on_close")]);
+    }
+
+    fn wire_request(token: &str) -> ControlWireRequest {
+        ControlWireRequest {
+            token: token.to_string(),
+            command: ControlCommand::Flush {
+                folder: None,
+                path: None,
+            },
+        }
+    }
+
+    #[test]
+    fn control_request_encoding_round_trips_and_is_bounded() {
+        let payload = encode_control_request(&wire_request("secret")).unwrap();
+        assert!(payload.ends_with(b"\n"));
+        let parsed =
+            validate_control_request(std::str::from_utf8(&payload).unwrap().trim_end(), "secret")
+                .unwrap();
+        assert!(matches!(parsed.command, ControlCommand::Flush { .. }));
+    }
+
+    #[test]
+    fn oversized_control_requests_are_rejected_before_parsing() {
+        let oversized = "x".repeat(MAX_CONTROL_REQUEST_BYTES + 1);
+        let error = validate_control_request(&oversized, "secret").unwrap_err();
+        assert!(error.contains("too large"));
+    }
+
+    #[test]
+    fn a_wrong_token_is_refused() {
+        let payload = serde_json::to_string(&wire_request("wrong")).unwrap();
+        let error = validate_control_request(&payload, "secret").unwrap_err();
+        assert_eq!(error, "unauthorized control request");
+    }
+
+    #[test]
+    fn a_huge_error_is_replaced_by_a_bounded_reply() {
+        let reply = ControlWireResponse {
+            ok: false,
+            synced: 0,
+            error: Some("e".repeat(MAX_CONTROL_REPLY_BYTES * 2)),
+        };
+        let bytes = encode_control_reply(reply);
+        assert!(bytes.len() <= MAX_CONTROL_REPLY_BYTES + 1);
+        let parsed: ControlWireResponse =
+            serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert!(!parsed.ok);
+        assert_eq!(parsed.error.as_deref(), Some("control reply too large"));
+    }
+
+    #[test]
+    fn removing_the_control_file_checks_it_is_still_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.daemon.ctl");
+        std::fs::write(&path, "new daemon").unwrap();
+        remove_control_file_if_unchanged(&path, "old daemon");
+        assert!(path.exists(), "a newer daemon's file must survive");
+        remove_control_file_if_unchanged(&path, "new daemon");
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn bounded_control_reads_refuse_an_unterminated_oversized_line() {
+        let raw = vec![b'x'; MAX_CONTROL_REQUEST_BYTES + 2];
+        let mut reader = BufReader::new(&raw[..]);
+        let error = read_line_bounded(&mut reader, MAX_CONTROL_REQUEST_BYTES)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     }
 }

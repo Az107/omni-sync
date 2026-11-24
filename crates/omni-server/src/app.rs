@@ -79,7 +79,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/overwrites", get(list_overwrites))
         .route("/api/v1/overwrites/{id}/dismiss", post(dismiss_overwrite))
         // Chunks.
-        .route("/api/v1/chunks/{hash}", put(put_chunk).get(get_chunk))
+        .route(
+            "/api/v1/chunks/{hash}",
+            put(put_chunk)
+                .get(get_chunk)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    omni_netproto::MAX_CHUNK_BYTES,
+                )),
+        )
         .with_state(state)
         // CORS is permissive on purpose: the API authenticates with a bearer
         // token in a header, never a cookie, so no cross-origin page can act as
@@ -96,15 +103,28 @@ pub enum AppError {
     Store(StoreError),
     Template(askama::Error),
     BadRequest(String),
+    /// The op is well-formed but references content that is not available yet
+    /// (a chunk that has not been uploaded). The client can retry.
+    Conflict(String),
     Unauthorized,
     NotFound,
+    TooManyRequests,
     Internal(String),
     Chunk(ChunkError),
 }
 
 impl From<StoreError> for AppError {
     fn from(error: StoreError) -> Self {
-        AppError::Store(error)
+        // A bad op is the client's fault, not a storage failure. Mapping these
+        // explicitly is what keeps a rejected batch at 400/409 instead of 500.
+        match error {
+            StoreError::InvalidOp(message) => AppError::BadRequest(message),
+            StoreError::MissingChunk { hash } => {
+                AppError::Conflict(format!("chunk {hash} has not been uploaded"))
+            }
+            StoreError::Unsupported(message) => AppError::BadRequest(message),
+            other => AppError::Store(other),
+        }
     }
 }
 
@@ -117,9 +137,9 @@ impl From<askama::Error> for AppError {
 impl From<ChunkError> for AppError {
     fn from(error: ChunkError) -> Self {
         match error {
-            ChunkError::Mismatch { .. } | ChunkError::InvalidHash(_) => {
-                AppError::BadRequest(error.to_string())
-            }
+            ChunkError::Mismatch { .. }
+            | ChunkError::InvalidHash(_)
+            | ChunkError::TooLarge { .. } => AppError::BadRequest(error.to_string()),
             ChunkError::Io(_) => AppError::Internal(error.to_string()),
         }
     }
@@ -129,8 +149,13 @@ impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             AppError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            AppError::Conflict(message) => (StatusCode::CONFLICT, message),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized".to_string()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            AppError::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many attempts; try again shortly".to_string(),
+            ),
             AppError::Store(error) => {
                 tracing::error!(%error, "store error");
                 (
@@ -433,6 +458,11 @@ async fn overwrite_resolve(
         .blocking(move |conn| sync::version(conn, losing))
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("unknown version {losing}")))?;
+    if version.folder_id != row.folder_id {
+        return Err(AppError::BadRequest(format!(
+            "version {losing} does not belong to this overwrite's folder"
+        )));
+    }
 
     let folder = row.folder_id.clone();
     let lookup = row.path.clone();
@@ -490,8 +520,17 @@ struct LoginForm {
 
 async fn login_submit(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     Form(form): Form<LoginForm>,
 ) -> Result<Response, AppError> {
+    let key = format!(
+        "login:{}",
+        client_key(&state, &headers, peer.map(|peer| peer.0.0))
+    );
+    if !state.auth_allowed(&key) {
+        return Err(AppError::TooManyRequests);
+    }
     if state.config.dashboard_password_hash.is_empty() {
         return Ok(Html(login_page(
             Some("no dashboard password is set — run `omni-sync-server init`"),
@@ -500,7 +539,23 @@ async fn login_submit(
         )?)
         .into_response());
     }
-    if !auth::verify_password(&form.password, &state.config.dashboard_password_hash) {
+
+    // Argon2 is CPU-heavy and deliberately slow. Run it on the blocking pool,
+    // with a permit bounding how many verifications compete for the runtime's
+    // CPU, so a login flood cannot stall the sync API.
+    let password = form.password;
+    let phc = state.config.dashboard_password_hash.clone();
+    let permit = state.hash_permit().ok_or(AppError::TooManyRequests)?;
+    let verified = tokio::task::spawn_blocking(move || {
+        // The blocking work survives request cancellation. Keep its permit
+        // inside the closure so cancelled callers cannot bypass the bound.
+        let _permit = permit;
+        auth::verify_password(&password, &phc)
+    })
+    .await
+    .map_err(|error| AppError::Internal(error.to_string()))?;
+
+    if !verified {
         return Ok(Html(login_page(
             Some("incorrect password"),
             safe_next(&form.next),
@@ -508,12 +563,16 @@ async fn login_submit(
         )?)
         .into_response());
     }
+    state.auth_reset(&key);
 
     let handle = state.create_session();
     let target = safe_next(&form.next);
     let mut response = Redirect::to(target).into_response();
-    let cookie =
+    let mut cookie =
         format!("{SESSION_COOKIE}={handle}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400");
+    if is_https(&state, &headers) {
+        cookie.push_str("; Secure");
+    }
     response.headers_mut().insert(
         header::SET_COOKIE,
         HeaderValue::from_str(&cookie).map_err(|e| AppError::Internal(e.to_string()))?,
@@ -526,7 +585,10 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
         state.drop_session(handle);
     }
     let mut response = Redirect::to("/login").into_response();
-    let cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    let mut cookie = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    if is_https(&state, &headers) {
+        cookie.push_str("; Secure");
+    }
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
@@ -592,13 +654,81 @@ async fn enroll_page(Query(query): Query<EnrollQuery>) -> Result<Response, AppEr
 /// `http://127.0.0.1` and `http://localhost` as trustworthy, so this is the
 /// one host an HTTPS page may hand off to; anything else would be an open
 /// redirect.
+///
+/// This parses the URL instead of prefix-matching it. Prefix matching is how
+/// `http://127.0.0.1:1234@evil.example/` slips through: everything up to the
+/// `@` looks like the loopback prefix, but the browser actually navigates to
+/// `evil.example`. The accepted shape is deliberately narrow — plain `http`,
+/// one of the literal loopback hosts, an explicit numeric port, no credentials
+/// in the authority, and no fragment. A path or query on that loopback origin
+/// is still loopback and is allowed.
 fn is_loopback_callback(cb: &str) -> bool {
-    if cb.bytes().any(|b| b < 0x20 || b == 0x7f) {
+    if cb
+        .bytes()
+        .any(|b| b < 0x20 || b == 0x7f || b == b' ' || b == b'\\')
+    {
         return false;
     }
-    ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"]
-        .iter()
-        .any(|prefix| cb.starts_with(prefix))
+    let Ok(url) = url::Url::parse(cb) else {
+        return false;
+    };
+    if url.scheme() != "http"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"))
+    {
+        return false;
+    }
+    let Some(authority_and_path) = cb.strip_prefix("http://") else {
+        return false;
+    };
+    // A fragment is never sent to the listener and would swallow the appended
+    // `code`; credentials in the authority are the userinfo attack. A path or
+    // query on the loopback origin is harmless and allowed.
+    if authority_and_path.contains('#') {
+        return false;
+    }
+    let authority_end = authority_and_path
+        .find(['/', '?'])
+        .unwrap_or(authority_and_path.len());
+    let authority = &authority_and_path[..authority_end];
+    if authority.contains('@') {
+        return false;
+    }
+
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        if &rest[..end] != "::1" {
+            return false;
+        }
+        let Some(port) = rest[end + 1..].strip_prefix(':') else {
+            return false;
+        };
+        ("::1", port)
+    } else {
+        let Some((host, port)) = authority.rsplit_once(':') else {
+            return false;
+        };
+        if host.contains(':') {
+            return false;
+        }
+        (host, port)
+    };
+
+    let host_is_loopback =
+        host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost");
+    host_is_loopback && valid_port(port)
+}
+
+/// A decimal TCP port in `1..=65535`, with no sign, whitespace or empty value.
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.len() <= 5
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().map(|port| port != 0).unwrap_or(false)
 }
 
 /// Percent-encode everything outside the RFC 3986 unreserved set. Used for the
@@ -619,8 +749,17 @@ fn percent_encode(value: &str) -> String {
 
 async fn enroll(
     State(state): State<AppState>,
+    headers: HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     Json(request): Json<EnrollRequest>,
 ) -> Result<Json<EnrollResponse>, AppError> {
+    let key = format!(
+        "enroll:{}",
+        client_key(&state, &headers, peer.map(|peer| peer.0.0))
+    );
+    if !state.auth_allowed(&key) {
+        return Err(AppError::TooManyRequests);
+    }
     if request.protocol_version != PROTOCOL_VERSION {
         return Err(AppError::BadRequest(format!(
             "unsupported protocol version {} (server speaks {PROTOCOL_VERSION})",
@@ -659,6 +798,7 @@ async fn enroll(
             "invalid, expired or already-used pairing code".into(),
         ));
     }
+    state.auth_reset(&key);
     Ok(Json(EnrollResponse { device_id, token }))
 }
 
@@ -891,13 +1031,35 @@ async fn submit_ops(
 ) -> Result<Json<SubmitOpsResponse>, AppError> {
     let device = authenticate(&state, &headers).await?;
 
-    let mut applied = Vec::new();
+    // Decode and validate the whole batch before committing any of it. If one
+    // op is malformed, the batch is refused and no prefix is applied, so a
+    // client retry cannot double-apply the earlier ops.
+    let ops = request
+        .ops
+        .iter()
+        .map(|dto| {
+            dto.to_core()
+                .map_err(|_| AppError::BadRequest("a path is not valid base64".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for op in &ops {
+        omni_store::sync::validate_op(op)?;
+    }
+
+    let lookup = folder_id.clone();
+    if !state
+        .store
+        .blocking(move |conn| folders::exists(conn, &lookup))
+        .await?
+    {
+        return Err(AppError::NotFound);
+    }
+
+    let results = state.apply_batch(&folder_id, &device.id, &ops).await?;
+
     let mut overwrites = Vec::new();
-    for dto in &request.ops {
-        let op = dto
-            .to_core()
-            .map_err(|_| AppError::BadRequest("a path is not valid base64".into()))?;
-        let result = state.apply(&folder_id, &device.id, op).await?;
+    let mut applied = Vec::with_capacity(results.len());
+    for (dto, result) in request.ops.iter().zip(results) {
         applied.push(AppliedOpDto {
             seq: result.seq,
             version_id: result.version_id,
@@ -914,7 +1076,9 @@ async fn submit_ops(
     }
 
     // Wake any streaming client: its op log just grew.
-    state.publish_ops(&folder_id);
+    if !applied.is_empty() {
+        state.publish_ops(&folder_id);
+    }
 
     Ok(Json(SubmitOpsResponse {
         applied,
@@ -1151,6 +1315,16 @@ async fn resolve(
     let device = authenticate(&state, &headers).await?;
     let path = omni_netproto::decode_path(&request.path)
         .map_err(|_| AppError::BadRequest("bad path".into()))?;
+    omni_store::sync::validate_path(&path)?;
+
+    let lookup = folder_id.clone();
+    if !state
+        .store
+        .blocking(move |conn| folders::exists(conn, &lookup))
+        .await?
+    {
+        return Err(AppError::NotFound);
+    }
 
     let version_id = request.restored_from;
     let version = state
@@ -1158,9 +1332,17 @@ async fn resolve(
         .blocking(move |conn| sync::version(conn, version_id))
         .await?
         .ok_or_else(|| AppError::BadRequest(format!("unknown version {version_id}")))?;
+    if version.folder_id != folder_id {
+        return Err(AppError::BadRequest(format!(
+            "version {version_id} does not belong to this folder"
+        )));
+    }
 
+    // The base is the active version of the path being *written*, not of the
+    // path the restored content came from: restoring `b` from a version of `a`
+    // must be compared against `b`'s active version to detect an overwrite.
     let folder = folder_id.clone();
-    let lookup_path = version.path.clone();
+    let lookup_path = path.clone();
     let active = state
         .store
         .blocking(move |conn| sync::active_version_id(conn, &folder, &lookup_path))
@@ -1206,7 +1388,17 @@ async fn put_chunk(
 ) -> Result<Json<ChunkPutResponse>, AppError> {
     let _device = authenticate(&state, &headers).await?;
     let size = body.len() as u64;
-    let created = state.chunks.put(&hash, &body)?;
+    if size > omni_netproto::MAX_CHUNK_BYTES as u64 {
+        return Err(AppError::BadRequest(format!(
+            "chunk is larger than the {}-byte limit",
+            omni_netproto::MAX_CHUNK_BYTES
+        )));
+    }
+    let chunks = state.chunks.clone();
+    let write_hash = hash.clone();
+    let created = tokio::task::spawn_blocking(move || chunks.put(&write_hash, &body))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
     let row_hash = hash.clone();
     state
         .store
@@ -1221,7 +1413,11 @@ async fn get_chunk(
     Path(hash): Path<String>,
 ) -> Result<Response, AppError> {
     let _device = authenticate(&state, &headers).await?;
-    match state.chunks.get(&hash)? {
+    let chunks = state.chunks.clone();
+    let bytes = tokio::task::spawn_blocking(move || chunks.get(&hash))
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))??;
+    match bytes {
         Some(bytes) => {
             Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
         }
@@ -1492,12 +1688,89 @@ fn login_page(error: Option<&str>, next: &str, _headers: &HeaderMap) -> Result<S
 
 /// Only allow same-origin redirect targets, so `?next=` cannot bounce a logged-in
 /// operator to another host.
+///
+/// Browsers normalise a backslash to `/` in a URL, so `/\evil.example` is a
+/// protocol-relative redirect to `evil.example` even though it does not start
+/// with `//`. Control bytes would either split the header or be silently
+/// stripped; both are refused rather than repaired.
 fn safe_next(next: &str) -> &str {
-    if next.starts_with('/') && !next.starts_with("//") {
-        next
-    } else {
+    if !next.starts_with('/')
+        || next.starts_with("//")
+        || next.bytes().any(|b| b == b'\\' || b < 0x20 || b == 0x7f)
+        || contains_encoded_redirect_control(next)
+    {
         "/"
+    } else {
+        next
     }
+}
+
+/// Reject percent-encoded backslash/CR/LF in a redirect target. Browsers do
+/// not treat these as a host separator, but refusing them keeps the rule easy
+/// to reason about and blocks a future decoder from turning one into a control.
+fn contains_encoded_redirect_control(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'%'
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            let byte = (high << 4) | low;
+            if matches!(byte, b'\\' | b'\r' | b'\n') {
+                return true;
+            }
+        }
+        index += 1;
+    }
+    false
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Should the session cookie carry `Secure`?
+///
+/// Only when the deployment explicitly says it is behind a TLS-terminating
+/// proxy and that proxy says the original request was HTTPS. Without
+/// `trust_forwarded_proto`, a direct request could set the header itself and
+/// either downgrade the cookie or claim HTTPS it does not have. Plain HTTP
+/// (including localhost development) never gets `Secure`.
+fn is_https(state: &AppState, headers: &HeaderMap) -> bool {
+    if !state.config.trust_forwarded_proto {
+        return false;
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|proto| proto.trim().eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
+}
+
+/// A rate-limit key for login/enrollment.
+///
+/// Direct callers are keyed by their socket address, never an untrusted header.
+/// A trusted proxy must append the verified source to X-Forwarded-For: only the
+/// last hop is used, so attacker-provided earlier entries cannot reset a budget.
+fn client_key(state: &AppState, headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> String {
+    if state.config.trust_forwarded_proto
+        && let Some(ip) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.trim().parse::<std::net::IpAddr>().ok())
+    {
+        return ip.to_string();
+    }
+    peer.map(|peer| peer.ip().to_string())
+        .unwrap_or_else(|| "unknown".into())
 }
 
 fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
@@ -1519,11 +1792,192 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
 
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request};
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use tower::ServiceExt as _;
+
+    use omni_netproto::{HeadResponse, ManifestResponse, SubmitOpsResponse};
+    use omni_store::{devices, folders};
+
+    const TOKEN: &str = "osn_test_token";
+
+    struct TestApp {
+        router: Router,
+        state: AppState,
+        _dir: tempfile::TempDir,
+    }
+
+    fn test_app() -> TestApp {
+        test_app_with(false, String::new())
+    }
+
+    fn test_app_with(trust_forwarded_proto: bool, dashboard_password_hash: String) -> TestApp {
+        test_app_with_ttl(
+            trust_forwarded_proto,
+            dashboard_password_hash,
+            std::time::Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    fn test_app_with_ttl(
+        trust_forwarded_proto: bool,
+        dashboard_password_hash: String,
+        session_ttl: std::time::Duration,
+    ) -> TestApp {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::Config {
+            addr: "127.0.0.1:0".into(),
+            data_dir: dir.path().join("data"),
+            state_dir: dir.path().join("state"),
+            dashboard_password_hash,
+            trust_forwarded_proto,
+        };
+        let state = AppState::with_session_ttl(
+            omni_store::Store::open_in_memory().unwrap(),
+            config,
+            session_ttl,
+        );
+        let router = router(state.clone());
+        TestApp {
+            router,
+            state,
+            _dir: dir,
+        }
+    }
+
+    fn seed_device(app: &TestApp) {
+        let device = devices::Device {
+            id: "dev-1".into(),
+            name: "test".into(),
+            pubkey: Vec::new(),
+            token_hash: auth::hash_token(TOKEN),
+            revoked: false,
+            last_seen_at: None,
+        };
+        app.state
+            .store
+            .with(|conn| devices::insert(conn, &device))
+            .unwrap();
+    }
+
+    fn seed_folder(app: &TestApp, id: &str) {
+        let folder = folders::Folder::new(id, "Documents");
+        app.state
+            .store
+            .with(|conn| folders::create(conn, &folder))
+            .unwrap();
+    }
+
+    async fn call(app: &TestApp, request: Request<Body>) -> Response {
+        app.router.clone().oneshot(request).await.unwrap()
+    }
+
+    fn api_request(method: Method, uri: &str, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .body(body)
+            .unwrap()
+    }
+
+    fn json_request(method: Method, uri: &str, value: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&value).unwrap()))
+            .unwrap()
+    }
+
+    async fn json_body<T: DeserializeOwned>(response: Response) -> T {
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Upload a chunk through the real endpoint, so the `chunks` row and the
+    /// on-disk file are both created the way a client would create them.
+    async fn store_chunk(app: &TestApp, bytes: &[u8]) -> String {
+        let hash = omni_chunk::hash_hex(bytes);
+        let request = api_request(
+            Method::PUT,
+            &format!("/api/v1/chunks/{hash}"),
+            Body::from(bytes.to_vec()),
+        );
+        let response = call(app, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        hash
+    }
+
+    async fn put_file(app: &TestApp, folder: &str, path: &[u8], bytes: &[u8]) -> i64 {
+        let hash = store_chunk(app, bytes).await;
+        let payload = json!({
+            "ops": [{
+                "kind": "put",
+                "path": omni_netproto::encode_path(path),
+                "size": bytes.len(),
+                "mtime_ns": 1,
+                "mode": 0o644,
+                "chunks": [{"hash": hash, "len": bytes.len()}],
+            }]
+        });
+        let response = call(
+            app,
+            json_request(
+                Method::POST,
+                &format!("/api/v1/folders/{folder}/ops"),
+                payload,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let applied: SubmitOpsResponse = json_body(response).await;
+        applied.applied[0].version_id
+    }
+
+    async fn manifest(app: &TestApp, folder: &str) -> ManifestResponse {
+        let response = call(
+            app,
+            api_request(
+                Method::GET,
+                &format!("/api/v1/folders/{folder}/manifest"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        json_body(response).await
+    }
+
+    async fn head(app: &TestApp, folder: &str) -> i64 {
+        let response = call(
+            app,
+            api_request(
+                Method::GET,
+                &format!("/api/v1/folders/{folder}/head"),
+                Body::empty(),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let head: HeadResponse = json_body(response).await;
+        head.head
+    }
+
     #[test]
     fn next_only_accepts_same_origin_paths() {
         assert_eq!(safe_next("/folders"), "/folders");
         assert_eq!(safe_next("//evil.example"), "/");
         assert_eq!(safe_next("https://evil.example"), "/");
+        // A browser treats `\` like `/`; `/\evil.example` is protocol-relative.
+        assert_eq!(safe_next("/\\evil.example"), "/");
+        assert_eq!(safe_next("/%5Cevil.example"), "/");
+        assert_eq!(safe_next("/%0d%0aX-Injected: 1"), "/");
+        assert_eq!(safe_next("/folders\r\nX-Injected: 1"), "/");
+        assert_eq!(safe_next("/folders\n"), "/");
     }
 
     #[test]
@@ -1562,11 +2016,62 @@ mod tests {
     fn only_loopback_callbacks_are_accepted() {
         assert!(is_loopback_callback("http://127.0.0.1:51234"));
         assert!(is_loopback_callback("http://localhost:8080"));
+        assert!(is_loopback_callback("http://LOCALHOST:8080"));
         assert!(is_loopback_callback("http://[::1]:9"));
         // A redirect to any other host would be an open redirect.
         assert!(!is_loopback_callback("https://evil.example/"));
+        assert!(!is_loopback_callback("https://127.0.0.1:8080"));
         assert!(!is_loopback_callback("http://10.0.0.5:80"));
         assert!(!is_loopback_callback("http://127.0.0.1:80\r\nX: y"));
+        // Prefix-matching used to accept this: the browser goes to evil.example.
+        assert!(!is_loopback_callback("http://127.0.0.1:1234@evil.example/"));
+        assert!(!is_loopback_callback("http://user:pass@127.0.0.1:1"));
+        assert!(!is_loopback_callback("http://127.0.0.1:1234#frag"));
+        // A path or query stays on the loopback origin, so it is allowed.
+        assert!(is_loopback_callback("http://127.0.0.1:1234?x=1"));
+        assert!(is_loopback_callback("http://127.0.0.1:1234/callback"));
+        assert!(!is_loopback_callback("http://127.0.0.1"));
+        assert!(!is_loopback_callback("http://127.0.0.1:0"));
+        assert!(!is_loopback_callback("http://127.0.0.1:99999"));
+        assert!(!is_loopback_callback("http://127.0.0.1:abc"));
+        assert!(!is_loopback_callback("http://127.0.0.1:12\\@evil.example/"));
+        assert!(!is_loopback_callback("http://2130706433:1234/"));
+        assert!(!is_loopback_callback("http://127.1:1234/"));
+        assert!(!is_loopback_callback("http://localhost.evil.example:1234/"));
+    }
+
+    #[test]
+    fn forwarding_headers_cannot_reset_the_authentication_budget() {
+        let state = AppState::new(
+            omni_store::Store::open_in_memory().unwrap(),
+            crate::config::Config {
+                trust_forwarded_proto: true,
+                ..Default::default()
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("spoofed-first, 192.0.2.1"),
+        );
+        let first = client_key(&state, &headers, None);
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("different-spoof, 192.0.2.1"),
+        );
+        assert_eq!(first, client_key(&state, &headers, None));
+        let direct = AppState::new(
+            omni_store::Store::open_in_memory().unwrap(),
+            Default::default(),
+        );
+        assert_eq!(
+            client_key(&direct, &headers, Some("192.0.2.9:10".parse().unwrap())),
+            "192.0.2.9"
+        );
+        assert_ne!(
+            client_key(&direct, &headers, Some("192.0.2.8:10".parse().unwrap())),
+            "192.0.2.9"
+        );
     }
 
     #[test]
@@ -1647,26 +2152,9 @@ mod tests {
         assert_eq!(view.lag, 0);
     }
 
-    /// Build a router over a throwaway in-memory store, for in-process requests.
-    fn test_router() -> Router {
-        let dir = tempfile::tempdir().unwrap();
-        let config = crate::config::Config {
-            addr: "127.0.0.1:0".into(),
-            data_dir: dir.path().join("data"),
-            state_dir: dir.path().join("state"),
-            dashboard_password_hash: String::new(),
-        };
-        router(AppState::new(
-            omni_store::Store::open_in_memory().unwrap(),
-            config,
-        ))
-    }
-
     #[tokio::test]
     async fn a_preflight_for_a_chunk_put_is_allowed() {
-        use axum::body::Body;
-        use axum::http::{Method, Request};
-        use tower::ServiceExt as _;
+        let app = test_app();
 
         // What a browser sends before a cross-origin `PUT /api/v1/chunks/<hash>`.
         let request = Request::builder()
@@ -1681,7 +2169,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        let response = test_router().oneshot(request).await.unwrap();
+        let response = app.router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response
@@ -1705,6 +2193,343 @@ mod tests {
                 .headers()
                 .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_with_a_missing_chunk_is_a_conflict_and_commits_nothing() {
+        let app = test_app();
+        seed_device(&app);
+        seed_folder(&app, "f1");
+        let stored = store_chunk(&app, b"hello").await;
+        let missing = omni_chunk::hash_hex(b"never uploaded");
+
+        let payload = json!({
+            "ops": [
+                {
+                    "kind": "put",
+                    "path": omni_netproto::encode_path(b"good.txt"),
+                    "size": 5,
+                    "mtime_ns": 1,
+                    "mode": 0o644,
+                    "chunks": [{"hash": stored, "len": 5}],
+                },
+                {
+                    "kind": "put",
+                    "path": omni_netproto::encode_path(b"bad.txt"),
+                    "size": 14,
+                    "mtime_ns": 1,
+                    "mode": 0o644,
+                    "chunks": [{"hash": missing, "len": 14}],
+                },
+            ]
+        });
+        let response = call(
+            &app,
+            json_request(Method::POST, "/api/v1/folders/f1/ops", payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // Neither op may have landed, including the one whose chunk exists.
+        assert_eq!(head(&app, "f1").await, 0);
+        assert!(manifest(&app, "f1").await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn path_attacks_are_rejected_and_nothing_is_committed() {
+        let app = test_app();
+        seed_device(&app);
+        seed_folder(&app, "f1");
+
+        for path in [
+            &b"../escape"[..],
+            b"/etc/passwd",
+            b"notes/../../escape",
+            b"a\0b",
+            b"notes\\todo.md",
+            b"C:evil",
+            b"\\\\server\\share",
+            b"a/../b",
+            b"a//b",
+            b"",
+        ] {
+            let payload = json!({
+                "ops": [{
+                    "kind": "put",
+                    "path": omni_netproto::encode_path(path),
+                    "size": 0,
+                    "mtime_ns": 0,
+                    "mode": 0,
+                    "chunks": [],
+                }]
+            });
+            let response = call(
+                &app,
+                json_request(Method::POST, "/api/v1/folders/f1/ops", payload),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "should reject {:?}",
+                String::from_utf8_lossy(path)
+            );
+        }
+        assert_eq!(head(&app, "f1").await, 0);
+        assert!(manifest(&app, "f1").await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_a_version_from_another_folder() {
+        let app = test_app();
+        seed_device(&app);
+        seed_folder(&app, "f1");
+        seed_folder(&app, "f2");
+        let version = put_file(&app, "f1", b"a.txt", b"hello").await;
+
+        let payload = json!({
+            "path": omni_netproto::encode_path(b"a.txt"),
+            "restored_from": version,
+        });
+        let response = call(
+            &app,
+            json_request(Method::POST, "/api/v1/folders/f2/resolve", payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(head(&app, "f2").await, 0);
+    }
+
+    #[tokio::test]
+    async fn resolve_uses_the_requested_path_as_its_active_base() {
+        let app = test_app();
+        seed_device(&app);
+        seed_folder(&app, "f1");
+        let source_version = put_file(&app, "f1", b"a.txt", b"one").await;
+        put_file(&app, "f1", b"b.txt", b"two").await;
+
+        // Restore a's content at b. b has an active version, so a correct
+        // lookup finds it and this is a linear resolve, not an overwrite.
+        let payload = json!({
+            "path": omni_netproto::encode_path(b"b.txt"),
+            "restored_from": source_version,
+        });
+        let response = call(
+            &app,
+            json_request(Method::POST, "/api/v1/folders/f1/resolve", payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = call(
+            &app,
+            api_request(Method::GET, "/api/v1/overwrites", Body::empty()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let overwrites: Vec<Value> = json_body(response).await;
+        assert!(
+            overwrites.is_empty(),
+            "a resolve at an existing path must not look like an overwrite: {overwrites:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_a_version_whose_chunks_are_missing_on_disk() {
+        let app = test_app();
+        seed_device(&app);
+        seed_folder(&app, "f1");
+        let bytes = b"hello";
+        let version = put_file(&app, "f1", b"a.txt", bytes).await;
+
+        let hash = omni_chunk::hash_hex(bytes);
+        let path = app.state.config.chunks_dir().join(&hash[..2]).join(&hash);
+        std::fs::remove_file(path).unwrap();
+
+        let payload = json!({
+            "path": omni_netproto::encode_path(b"a.txt"),
+            "restored_from": version,
+        });
+        let response = call(
+            &app,
+            json_request(Method::POST, "/api/v1/folders/f1/resolve", payload),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_loopback_callback_redirects_but_userinfo_does_not() {
+        let app = test_app();
+
+        let valid = Request::builder()
+            .uri("/enroll?code=ABCD&cb=http://localhost:49152")
+            .body(Body::empty())
+            .unwrap();
+        let response = call(&app, valid).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "http://localhost:49152?code=ABCD"
+        );
+
+        // Everything before `@` looks like a loopback prefix, but the browser
+        // would go to evil.example. It must render the page, not redirect.
+        let attack = Request::builder()
+            .uri("/enroll?code=ABCD&cb=http://127.0.0.1:1234@evil.example/")
+            .body(Body::empty())
+            .unwrap();
+        let response = call(&app, attack).await;
+        assert_ne!(response.status(), StatusCode::SEE_OTHER);
+        assert!(response.headers().get(header::LOCATION).is_none());
+    }
+
+    fn login_request(forwarded_proto: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        if let Some(proto) = forwarded_proto {
+            builder = builder.header("x-forwarded-proto", proto);
+        }
+        builder
+            .body(Body::from("password=secret&next=%2Ffolders"))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_session_cookie_is_secure_only_when_https_is_trusted() {
+        let phc = auth::hash_password("secret").unwrap();
+
+        // Plain HTTP, even with a forged header, must not claim Secure.
+        let app = test_app_with(false, phc.clone());
+        let response = call(&app, login_request(Some("https"))).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!cookie.contains("Secure"), "untrusted header: {cookie}");
+
+        // Trusted proxy + https is the one combination that sets Secure.
+        let app = test_app_with(true, phc.clone());
+        let response = call(&app, login_request(Some("https"))).await;
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(cookie.contains("; Secure"), "trusted https: {cookie}");
+
+        // Trusted proxy but plain HTTP (localhost development) stays usable.
+        let app = test_app_with(true, phc);
+        let response = call(&app, login_request(None)).await;
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!cookie.contains("Secure"), "plain http: {cookie}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_cookie_is_sent_back_to_login() {
+        let app = test_app_with_ttl(
+            false,
+            auth::hash_password("secret").unwrap(),
+            std::time::Duration::from_millis(10),
+        );
+        let response = call(&app, login_request(None)).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let handle = cookie.split(';').next().unwrap().to_string();
+
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let request = Request::builder()
+            .uri("/")
+            .header(header::COOKIE, handle)
+            .body(Body::empty())
+            .unwrap();
+        let response = call(&app, request).await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert_eq!(response.headers().get(header::LOCATION).unwrap(), "/login");
+    }
+
+    #[tokio::test]
+    async fn enrollment_attempts_are_rate_limited() {
+        let app = test_app();
+        let payload = json!({
+            "code": "NOPE",
+            "name": "test",
+            "protocol_version": PROTOCOL_VERSION,
+        });
+        for _ in 0..10 {
+            let response = call(
+                &app,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/devices/enroll")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = call(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/devices/enroll")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn one_source_exhausting_its_budget_does_not_lock_out_other_sources() {
+        let app = test_app();
+        let payload = serde_json::to_vec(&json!({
+            "code": "INVALID", "name": "test", "protocol_version": PROTOCOL_VERSION,
+        }))
+        .unwrap();
+        let request = |source: &str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/devices/enroll")
+                .extension(axum::extract::ConnectInfo(
+                    source.parse::<std::net::SocketAddr>().unwrap(),
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.clone()))
+                .unwrap()
+        };
+        for _ in 0..10 {
+            assert_eq!(
+                call(&app, request("192.0.2.1:1234")).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            call(&app, request("192.0.2.1:9999")).await.status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            call(&app, request("192.0.2.2:1234")).await.status(),
+            StatusCode::BAD_REQUEST
         );
     }
 }

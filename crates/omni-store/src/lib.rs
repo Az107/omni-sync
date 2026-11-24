@@ -35,6 +35,15 @@ pub enum StoreError {
     Json(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// An op that cannot be committed: a bad path, a malformed chunk list, or
+    /// metadata that does not add up. Always a client error (400), never a
+    /// storage failure.
+    #[error("invalid op: {0}")]
+    InvalidOp(String),
+    /// The op references a chunk that is not stored. Retryable once the chunk
+    /// has been uploaded (409).
+    #[error("missing chunk {hash}")]
+    MissingChunk { hash: String },
 }
 
 /// A handle to the database. Cloneable; all clones share one connection.

@@ -18,6 +18,11 @@ pub use convert::{decode_chunks, decode_file_meta, encode_chunks, entry_path};
 /// Bumped when the wire shape changes incompatibly. `Hello`/`enroll` carry it.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The HTTP chunk-body ceiling. Matches the API's existing 2 MiB body limit;
+/// the default chunker emits at most 1 MiB. Keep clients' preflight checks and
+/// the chunk route aligned so custom chunkers fail with a useful local error.
+pub const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
 /// Encode a raw path for the wire.
 pub fn encode_path(path: &[u8]) -> String {
     B64.encode(path)
@@ -191,9 +196,8 @@ pub struct OpsResponse {
     /// older server that never sent it) still parses.
     #[serde(default)]
     pub next: i64,
-    /// Whether an op with `seq > next` exists. Ignored by the Rust client,
-    /// which pulls until a page comes back empty; the paginated browser/WebView
-    /// client uses it to know when to stop.
+    /// Whether an op with `seq > next` exists. Both the Rust daemon and the
+    /// browser/WebView client use this to finish historical pages before push.
     #[serde(default)]
     pub has_more: bool,
 }

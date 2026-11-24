@@ -30,6 +30,21 @@ pub struct Config {
     pub state_dir: PathBuf,
     /// Argon2 PHC string for the dashboard login. Empty means "no password set".
     pub dashboard_password_hash: String,
+    /// Trust `X-Forwarded-Proto` from the reverse proxy when deciding whether
+    /// to mark the session cookie `Secure`, and the proxy-appended final source
+    /// address in `X-Forwarded-For` for login/enrollment rate limiting.
+    ///
+    /// This is deliberately **off** by default: the server binds plain HTTP and
+    /// anyone can send that header, so honouring it unconditionally would let a
+    /// direct request pretend to be HTTPS (and, worse, a direct HTTP request
+    /// could be told to omit `Secure`). Enable it only when the listener is
+    /// reachable exclusively through a proxy that overwrites the scheme header
+    /// and appends a verified client IP to `X-Forwarded-For` (the
+    /// space-elevator/Traefik deployment does). Plain-HTTP localhost keeps
+    /// working either way because the cookie is only `Secure` when the header
+    /// says `https`.
+    #[serde(default)]
+    pub trust_forwarded_proto: bool,
 }
 
 impl Default for Config {
@@ -49,6 +64,7 @@ impl Default for Config {
             data_dir,
             state_dir,
             dashboard_password_hash: String::new(),
+            trust_forwarded_proto: false,
         }
     }
 }
@@ -66,9 +82,10 @@ impl Config {
     /// overrides. A missing file is not an error: defaults are a valid server.
     ///
     /// Container-friendly env, all optional: `OMNI_SYNC_ADDR`,
-    /// `OMNI_SYNC_DATA_DIR`, `OMNI_SYNC_STATE_DIR`, and `OMNI_SYNC_PASSWORD`
+    /// `OMNI_SYNC_DATA_DIR`, `OMNI_SYNC_STATE_DIR`, `OMNI_SYNC_PASSWORD`
     /// (hashed in memory when no stored hash exists, so a container needs no
-    /// pre-baked config file).
+    /// pre-baked config file), and `OMNI_SYNC_TRUST_FORWARDED_PROTO=1` for a
+    /// proxy-fronted deployment that terminates TLS.
     pub fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
         let path = explicit
             .map(Path::to_path_buf)
@@ -102,6 +119,12 @@ impl Config {
         {
             config.dashboard_password_hash =
                 crate::auth::hash_password(&password).unwrap_or_default();
+        }
+        if let Ok(value) = std::env::var("OMNI_SYNC_TRUST_FORWARDED_PROTO") {
+            config.trust_forwarded_proto = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            );
         }
         Ok(config)
     }

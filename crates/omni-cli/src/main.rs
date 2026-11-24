@@ -8,6 +8,7 @@
 
 mod daemon;
 mod link;
+mod lock;
 mod service;
 mod wizard;
 
@@ -351,6 +352,39 @@ fn interactive() -> bool {
     std::io::stdin().is_terminal()
 }
 
+/// Who owns the agent database for a one-shot CLI command.
+enum OneShotOwnership {
+    /// We hold the exclusive lock and may run an engine in this process.
+    Locked(lock::InstanceLock),
+    /// A daemon took ownership between the first handoff attempt and the lock
+    /// attempt; it accepted the command instead.
+    Daemon(usize),
+}
+
+/// Take the same OS lock the daemon uses, after the caller's control handoff
+/// came back empty.
+///
+/// The handoff is always attempted first, so a running daemon executes the
+/// command inside its own engine. If the lock is busy here, a daemon may have
+/// started in the small window between the handoff and this call: retry the
+/// handoff once rather than racing a second engine against its startup.
+async fn claim_one_shot(
+    config_path: &Path,
+    command: &daemon::ControlCommand,
+) -> anyhow::Result<OneShotOwnership> {
+    match lock::InstanceLock::try_acquire(config_path) {
+        Ok(lock) => Ok(OneShotOwnership::Locked(lock)),
+        Err(lock::LockError::Busy) => {
+            match daemon::try_send_command(config_path, command.clone()).await {
+                Ok(Some(synced)) => Ok(OneShotOwnership::Daemon(synced)),
+                Ok(None) => bail!("{}", lock::busy_message(config_path)),
+                Err(error) => Err(error.context("handing the command to the running daemon")),
+            }
+        }
+        Err(lock::LockError::Io(error)) => Err(error.into()),
+    }
+}
+
 /// A sensible default device name.
 fn hostname() -> String {
     std::env::var("HOSTNAME")
@@ -573,17 +607,23 @@ async fn add(
 
     // Start syncing immediately: if a daemon is running, tell it to reload its
     // config and sync the new folder; otherwise run one initial sync cycle
-    // in-process so existing files move right away.
-    match daemon::try_send_command(
-        config_path,
-        daemon::ControlCommand::ReloadAndSync {
-            folder_id: Some(folder_id.clone()),
-        },
-    )
-    .await
-    {
+    // in-process so existing files move right away. The in-process engine must
+    // own the same OS lock as a daemon, so a startup race cannot leave two
+    // engines on one database.
+    let command = daemon::ControlCommand::ReloadAndSync {
+        folder_id: Some(folder_id.clone()),
+    };
+    match daemon::try_send_command(config_path, command.clone()).await {
         Ok(Some(_)) => {}
         Ok(None) => {
+            let ownership = claim_one_shot(config_path, &command).await?;
+            let _lock = match ownership {
+                OneShotOwnership::Locked(lock) => lock,
+                OneShotOwnership::Daemon(_) => {
+                    println!("watching folder {} at {}", folder_id, path.display());
+                    return Ok(());
+                }
+            };
             let store = Store::open_agent(&agent_db_path(config_path))?;
             let engine = Engine::new(client, store, cfg);
             if let Err(error) = engine.sync_once().await {
@@ -817,18 +857,27 @@ async fn flush(config_path: &Path, folder: Option<&str>, path: Option<&str>) -> 
 
     // If a daemon is already running for this config, ask it to execute the
     // flush so we never run a second concurrent engine on the same database.
-    if let Some(synced) = daemon::try_send_command(
-        config_path,
-        daemon::ControlCommand::Flush {
-            folder: folder.map(str::to_owned),
-            path: path.map(str::to_owned),
-        },
-    )
-    .await?
-    {
+    let command = daemon::ControlCommand::Flush {
+        folder: folder.map(str::to_owned),
+        path: path.map(str::to_owned),
+    };
+    if let Some(synced) = daemon::try_send_command(config_path, command.clone()).await? {
         println!("synced {synced} folder(s) via running daemon");
         return Ok(());
     }
+
+    // No daemon answered, so this process runs the engine — but only after
+    // taking the same exclusive lock the daemon uses. If a daemon is starting
+    // in the gap, claim_one_shot retries the handoff and otherwise fails
+    // safely instead of racing it on agent.db.
+    let ownership = claim_one_shot(config_path, &command).await?;
+    let _lock = match ownership {
+        OneShotOwnership::Locked(lock) => lock,
+        OneShotOwnership::Daemon(synced) => {
+            println!("synced {synced} folder(s) via running daemon");
+            return Ok(());
+        }
+    };
 
     let store = Store::open_agent(&agent_db_path(config_path))?;
     let target_path = path.map(|p| path_bytes(Path::new(p)));
@@ -1088,5 +1137,23 @@ mod tests {
         write_private(&target, "first = 1\n").unwrap();
         write_private(&target, "second = 2\n").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second = 2\n");
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_engine_refuses_a_held_instance_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("client.toml");
+        let _held = lock::InstanceLock::try_acquire(&config).unwrap();
+        let result = claim_one_shot(
+            &config,
+            &daemon::ControlCommand::Flush {
+                folder: None,
+                path: None,
+            },
+        )
+        .await;
+        assert!(result.is_err());
+        let message = result.err().unwrap().to_string();
+        assert!(message.contains("holds the lock"), "{message}");
     }
 }

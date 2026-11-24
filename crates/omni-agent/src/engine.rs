@@ -216,7 +216,7 @@ impl Engine {
                     let _ = request.reply.send(result);
                 }
                 Some(()) = wake.recv() => {
-                    has_holds = self.logged_cycle("pull", self.pull_inner(false, None)).await;
+                    has_holds = self.logged_cycle("pull", self.sync_step(false, None)).await;
                 }
                 event = events.recv() => {
                     if event.is_none() {
@@ -234,7 +234,7 @@ impl Engine {
                     has_holds = self.logged_cycle("safety scan", self.push_inner(false, None)).await;
                 }
                 _ = fallback.tick() => {
-                    has_holds = self.logged_cycle("pull", self.pull_inner(false, None)).await;
+                    has_holds = self.logged_cycle("pull", self.sync_step(false, None)).await;
                 }
             }
         }
@@ -347,7 +347,7 @@ impl Engine {
         // `changes` treats a path in `last` but not in `current` as a Delete,
         // so leaving it here would delete the file on every other device the
         // moment a folder's excludes change.
-        let last = baseline_excluding(last, &self.ignore);
+        let mut last = baseline_excluding(last, &self.ignore);
         let previously_held: std::collections::BTreeMap<PathBytes, String> = previously_held
             .into_iter()
             .filter(|(path, _)| !self.ignore.matches(path))
@@ -360,12 +360,16 @@ impl Engine {
             ignore: self.ignore.clone(),
             preserve_permissions: self.config.preserve_permissions,
         };
-        let current =
-            tokio::task::spawn_blocking(move || scan::scan(&root, &chunker, &previous, options))
-                .await
-                .context("scan task panicked")??;
+        let scanned = tokio::task::spawn_blocking(move || {
+            scan::scan_with_deferred(&root, &chunker, &previous, options)
+        })
+        .await
+        .context("scan task panicked")??;
+        // A skipped unstable/unreadable/unsupported path is not a deletion.
+        last.retain(|path, _| !scanned.is_deferred(path));
+        let current = scanned.manifest;
 
-        let local = changes(&last, &current);
+        let local = local_changes(&last, &current, &versions);
         let dirty_paths: BTreeSet<PathBytes> = local
             .iter()
             .map(|change| match change {
@@ -432,11 +436,18 @@ impl Engine {
                     let (root, rel) = (self.config.root.clone(), path.clone());
                     let chunker = self.chunker;
                     let preserve_permissions = self.config.preserve_permissions;
-                    let (meta, hashed) = tokio::task::spawn_blocking(move || {
+                    let read = tokio::task::spawn_blocking(move || {
                         scan::chunk_file(&root, &rel, &chunker, preserve_permissions)
                     })
                     .await
-                    .context("chunk task panicked")??;
+                    .context("chunk task panicked")?;
+                    let (meta, hashed) = match read {
+                        Ok(read) => read,
+                        Err(error) => {
+                            tracing::warn!(path = ?path, %error, "deferring changed or unreadable file");
+                            continue;
+                        }
+                    };
                     for chunk in &hashed {
                         self.client
                             .put_chunk(&chunk.hash, chunk.data.clone())
@@ -478,6 +489,11 @@ impl Engine {
             .submit_ops(&self.config.folder_id, dtos)
             .await
             .context("submitting ops")?;
+        if response.applied.len() != pending.len() {
+            return Err(anyhow!(
+                "server returned an incomplete operation acknowledgement"
+            ));
+        }
 
         let store = self.store.clone();
         let folder = self.config.folder_id.clone();
@@ -543,22 +559,69 @@ impl Engine {
         }
 
         let folder = self.config.folder_id.clone();
-        let (since, mut versions) = {
-            let (f1, f2) = (folder.clone(), folder.clone());
-            let since = self
-                .store
-                .blocking(move |conn| agent::applied_seq(conn, &f1))
+        let mut since = self
+            .store
+            .blocking(move |conn| agent::applied_seq(conn, &folder))
+            .await?;
+        let mut latest = std::collections::BTreeMap::new();
+        loop {
+            let response = self
+                .client
+                .ops_page(&self.config.folder_id, since, Some(500))
                 .await?;
+            let mut previous = since;
+            for entry in &response.entries {
+                if entry.seq <= previous {
+                    return Err(anyhow!("server sent an unordered operation page"));
+                }
+                previous = entry.seq;
+                let path =
+                    decode_path(&entry.path).map_err(|_| anyhow!("server sent a bad path"))?;
+                latest.insert(path, (entry.version_id, entry.kind));
+            }
+            let held = self
+                .apply_entries(response.entries, ignore_holds, only_override_path)
+                .await?;
+            if held {
+                return Ok(true);
+            }
+            if !response.has_more {
+                self.adopt_equivalent_conflicts(&latest).await?;
+                return Ok(false);
+            }
+            if previous <= since {
+                return Err(anyhow!("server sent an operation page without progress"));
+            }
+            // Finish all historical pages before the first push. Bounded
+            // per-request pages must not turn a partial bootstrap into a push
+            // with unknown baselines for paths on later pages.
+            since = previous;
+        }
+    }
+
+    async fn apply_entries(
+        &self,
+        entries: Vec<omni_netproto::LogEntryDto>,
+        ignore_holds: bool,
+        only_override_path: Option<&[u8]>,
+    ) -> Result<bool> {
+        let folder = self.config.folder_id.clone();
+        let (mut versions, mut baseline) = {
+            let (f2, f3) = (folder.clone(), folder.clone());
             let versions = self
                 .store
                 .blocking(move |conn| agent::versions(conn, &f2))
                 .await?;
-            (since, versions)
+            let baseline = self
+                .store
+                .blocking(move |conn| agent::manifest(conn, &f3))
+                .await?;
+            (versions, baseline)
         };
 
-        let response = self.client.ops_since(&self.config.folder_id, since).await?;
-        for entry in response.entries {
+        for entry in entries {
             let path = decode_path(&entry.path).map_err(|_| anyhow!("server sent a bad path"))?;
+            apply::validate_rel(&path).map_err(|_| anyhow!("server sent an unsafe path"))?;
 
             // An excluded path is never applied, but the watermark must still
             // move past it or every pull would replay it forever. This also
@@ -573,13 +636,45 @@ impl Engine {
                 continue;
             }
 
+            if versions.get(&path) == Some(&0) {
+                let folder = folder.clone();
+                let seq = entry.seq;
+                let remote = FileMeta {
+                    size: if entry.kind == OpKindDto::Delete {
+                        0
+                    } else {
+                        entry.size
+                    },
+                    mtime_ns: 0,
+                    mode: if self.config.preserve_permissions {
+                        entry.mode
+                    } else {
+                        0
+                    },
+                    chunks: if entry.kind == OpKindDto::Delete {
+                        vec![]
+                    } else {
+                        decode_chunks(&entry.chunks)
+                    },
+                };
+                baseline.insert(path.clone(), remote.clone());
+                self.store
+                    .blocking(move |conn| {
+                        agent::set_file(conn, &folder, &path, &remote, 0)?;
+                        agent::set_applied_seq(conn, &folder, seq)
+                    })
+                    .await?;
+                continue;
+            }
+            let local_before = self.local_snapshot(&path)?;
             let disk_path = self.config.root.join(scan::path_from_bytes(&path));
+            let disk_exists = local_before.is_some();
             let override_this =
                 ignore_holds && only_override_path.is_none_or(|target| target == path.as_slice());
 
             if !override_this
                 && self.config.mode == SyncMode::OnClose
-                && disk_path.exists()
+                && disk_exists
                 && let Some(reason) = hold::check_file(&disk_path, &self.config.hold_rule, false)
             {
                 let folder = folder.clone();
@@ -590,11 +685,81 @@ impl Engine {
                 return Ok(true);
             }
 
+            // On first sync, a differing pre-existing file gets a synthetic
+            // version-zero baseline. Keep it protected for the entire replay,
+            // including later puts and deletes in the same historical tail.
+            if !baseline.contains_key(&path)
+                && !versions.contains_key(&path)
+                && let Some(local) = local_before.as_ref()
+                && matches!(
+                    entry.kind,
+                    OpKindDto::Put | OpKindDto::Resolve | OpKindDto::Move
+                )
+            {
+                let remote = FileMeta {
+                    size: entry.size,
+                    mtime_ns: entry.mtime_ns,
+                    mode: entry.mode,
+                    chunks: decode_chunks(&entry.chunks),
+                };
+                if local.equivalent(&remote) {
+                    let folder = folder.clone();
+                    let seq = entry.seq;
+                    let version = entry.version_id;
+                    let adopted = local.clone();
+                    versions.insert(path.clone(), version);
+                    baseline.insert(path.clone(), local.clone());
+                    self.store
+                        .blocking(move |conn| {
+                            agent::set_file(conn, &folder, &path, &adopted, version)?;
+                            agent::set_applied_seq(conn, &folder, seq)
+                        })
+                        .await?;
+                    continue;
+                }
+            }
+            if pull_conflicts(baseline.get(&path), local_before.as_ref()) {
+                let folder = folder.clone();
+                let seq = entry.seq;
+                if let Some(local) = local_before {
+                    let remote_base = match entry.kind {
+                        OpKindDto::Put | OpKindDto::Resolve | OpKindDto::Move => FileMeta {
+                            size: entry.size,
+                            mtime_ns: 0,
+                            mode: entry.mode,
+                            chunks: decode_chunks(&entry.chunks),
+                        },
+                        OpKindDto::Delete => FileMeta {
+                            size: 0,
+                            mtime_ns: 0,
+                            mode: local.mode,
+                            chunks: Vec::new(),
+                        },
+                    };
+                    let version = 0;
+                    versions.insert(path.clone(), version);
+                    baseline.insert(path.clone(), remote_base.clone());
+                    self.store
+                        .blocking(move |conn| {
+                            agent::set_file(conn, &folder, &path, &remote_base, version)?;
+                            agent::set_applied_seq(conn, &folder, seq)
+                        })
+                        .await?;
+                } else {
+                    self.store
+                        .blocking(move |conn| agent::set_applied_seq(conn, &folder, seq))
+                        .await?;
+                }
+                continue;
+            }
+            let snapshot = local_before;
+
             match entry.kind {
                 OpKindDto::Delete => {
                     apply::remove_file(&self.config.root, &path)
                         .with_context(|| format!("deleting {}", String::from_utf8_lossy(&path)))?;
                     versions.remove(&path);
+                    baseline.remove(&path);
                     let folder = folder.clone();
                     self.store
                         .blocking(move |conn| agent::remove_file(conn, &folder, &path))
@@ -605,8 +770,7 @@ impl Engine {
                     // Skip re-downloading and rewriting our own already-applied
                     // version when a cross-folder sequence gap causes `ops_since`
                     // to replay it.
-                    if versions.get(&path).copied() == Some(entry.version_id) && disk_path.exists()
-                    {
+                    if versions.get(&path).copied() == Some(entry.version_id) && disk_exists {
                         let folder = folder.clone();
                         let seq = entry.seq;
                         self.store
@@ -615,61 +779,37 @@ impl Engine {
                         continue;
                     }
 
-                    // On first sync of this path (`!versions.contains_key`), if
-                    // a file already exists on disk, check whether its content
-                    // matches the server's before overwriting it.
-                    if !versions.contains_key(&path)
-                        && disk_path.exists()
-                        && let Ok((local_meta, _)) = scan::chunk_file(
-                            &self.config.root,
-                            &path,
-                            &self.chunker,
-                            self.config.preserve_permissions,
-                        )
-                    {
-                        let remote_meta = FileMeta {
+                    let bytes = self.fetch_chunks(&entry.chunks).await?;
+                    if bytes.len() as u64 != entry.size {
+                        return Err(anyhow!("server sent an inconsistent file size"));
+                    }
+                    // The file can become dirty while chunks are in flight.
+                    // Re-check immediately before replacement; preserve the
+                    // local edit and let push record it as an overwrite.
+                    let local_after = self.local_snapshot(&path)?;
+                    if changed_since_snapshot(snapshot.as_ref(), local_after.as_ref()) {
+                        let folder = folder.clone();
+                        let seq = entry.seq;
+                        let baseline = FileMeta {
                             size: entry.size,
-                            mtime_ns: entry.mtime_ns,
+                            mtime_ns: 0,
                             mode: entry.mode,
                             chunks: remote_chunks.clone(),
                         };
-                        if local_meta.equivalent(&remote_meta) {
-                            let folder = folder.clone();
-                            let version_id = entry.version_id;
-                            let seq = entry.seq;
-                            versions.insert(path.clone(), version_id);
-                            self.store
-                                .blocking(move |conn| {
-                                    agent::set_file(conn, &folder, &path, &local_meta, version_id)?;
-                                    agent::set_applied_seq(conn, &folder, seq)
-                                })
-                                .await?;
-                            continue;
-                        } else {
-                            // Preserve the conflicting local file on disk and
-                            // record a synthetic baseline (`mtime_ns = 0`,
-                            // `version_id = 0`) so the next `push` uploads the
-                            // local file and records an overwrite on the server.
-                            let folder = folder.clone();
-                            let seq = entry.seq;
-                            let baseline = FileMeta {
-                                size: entry.size,
-                                mtime_ns: 0,
-                                mode: entry.mode,
-                                chunks: remote_chunks,
-                            };
-                            versions.insert(path.clone(), 0);
-                            self.store
-                                .blocking(move |conn| {
-                                    agent::set_file(conn, &folder, &path, &baseline, 0)?;
-                                    agent::set_applied_seq(conn, &folder, seq)
-                                })
-                                .await?;
-                            continue;
-                        }
+                        versions.insert(path.clone(), 0);
+                        self.store
+                            .blocking(move |conn| {
+                                agent::set_file(conn, &folder, &path, &baseline, 0)?;
+                                agent::set_applied_seq(conn, &folder, seq)
+                            })
+                            .await?;
+                        continue;
                     }
-
-                    let bytes = self.fetch_chunks(&entry.chunks).await?;
+                    let applied_mode = if self.config.preserve_permissions {
+                        entry.mode
+                    } else {
+                        0
+                    };
                     apply::write_file(
                         &self.config.root,
                         &path,
@@ -677,7 +817,7 @@ impl Engine {
                         &FileMeta {
                             size: entry.size,
                             mtime_ns: entry.mtime_ns,
-                            mode: entry.mode,
+                            mode: applied_mode,
                             chunks: remote_chunks.clone(),
                         },
                     )
@@ -690,12 +830,13 @@ impl Engine {
                     let meta = FileMeta {
                         size: entry.size,
                         mtime_ns,
-                        mode: entry.mode,
+                        mode: applied_mode,
                         chunks: remote_chunks,
                     };
                     let folder = folder.clone();
                     let version_id = entry.version_id;
                     versions.insert(path.clone(), version_id);
+                    baseline.insert(path.clone(), meta.clone());
                     self.store
                         .blocking(move |conn| {
                             agent::set_file(conn, &folder, &path, &meta, version_id)
@@ -725,9 +866,72 @@ impl Engine {
             if omni_chunk::hash_hex(&data) != chunk.hash {
                 return Err(anyhow!("chunk {} failed verification", chunk.hash));
             }
+            if data.len() as u64 != chunk.len {
+                return Err(anyhow!("chunk {} has an inconsistent length", chunk.hash));
+            }
             bytes.extend_from_slice(&data);
         }
         Ok(bytes)
+    }
+
+    fn local_snapshot(&self, path: &[u8]) -> Result<Option<FileMeta>> {
+        match scan::chunk_file(
+            &self.config.root,
+            path,
+            &self.chunker,
+            self.config.preserve_permissions,
+        ) {
+            Ok((meta, _)) => Ok(Some(meta)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error)
+                .with_context(|| format!("reading local file {path:?} before remote apply")),
+        }
+    }
+
+    async fn adopt_equivalent_conflicts(
+        &self,
+        latest: &std::collections::BTreeMap<PathBytes, (i64, OpKindDto)>,
+    ) -> Result<()> {
+        let folder = self.config.folder_id.clone();
+        let lookup = folder.clone();
+        let (versions, baseline) = self
+            .store
+            .blocking(move |conn| {
+                Ok((
+                    agent::versions(conn, &lookup)?,
+                    agent::manifest(conn, &lookup)?,
+                ))
+            })
+            .await?;
+        for (path, (version, kind)) in latest {
+            if versions.get(path) != Some(&0) || self.ignore.matches(path) {
+                continue;
+            }
+            let local = match self.local_snapshot(path) {
+                Ok(local) => local,
+                Err(error) => {
+                    tracing::warn!(path = ?path, %error, "leaving local conflict pending");
+                    continue;
+                }
+            };
+            let folder = folder.clone();
+            let path = path.clone();
+            if *kind == OpKindDto::Delete {
+                if local.is_none() {
+                    self.store
+                        .blocking(move |conn| agent::remove_file(conn, &folder, &path))
+                        .await?;
+                }
+            } else if let (Some(local), Some(remote)) = (local, baseline.get(&path))
+                && local.equivalent(remote)
+            {
+                let version = *version;
+                self.store
+                    .blocking(move |conn| agent::set_file(conn, &folder, &path, &local, version))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -748,6 +952,53 @@ fn baseline_excluding(last: Manifest, ignore: &Ignore) -> Manifest {
     last.into_iter()
         .filter(|(path, _)| !ignore.matches(path))
         .collect()
+}
+
+fn local_changes(
+    last: &Manifest,
+    current: &Manifest,
+    versions: &std::collections::BTreeMap<PathBytes, i64>,
+) -> Vec<Change> {
+    let mut result = changes(last, current);
+    let changed: BTreeSet<_> = result
+        .iter()
+        .map(|change| match change {
+            Change::Put { path, .. } | Change::Delete { path } => path.clone(),
+        })
+        .collect();
+    // Version zero is an explicit pending conflict, not an accepted baseline.
+    // Even if the user changes it back to equivalent content, push once so the
+    // synthetic marker cannot permanently block subsequent remote operations.
+    for (path, version) in versions {
+        if *version == 0 && last.contains_key(path) && !changed.contains(path) {
+            result.push(match current.get(path) {
+                Some(meta) => Change::Put {
+                    path: path.clone(),
+                    meta: meta.clone(),
+                },
+                None => Change::Delete { path: path.clone() },
+            });
+        }
+    }
+    result
+}
+
+/// A pull may replace a path only when the local file still matches what this
+/// client last accepted. Missing/untracked local files are dirty as well.
+fn pull_conflicts(baseline: Option<&FileMeta>, local: Option<&FileMeta>) -> bool {
+    match (baseline, local) {
+        (None, None) => false,
+        (Some(base), Some(current)) => !base.equivalent(current),
+        _ => true,
+    }
+}
+
+fn changed_since_snapshot(before: Option<&FileMeta>, after: Option<&FileMeta>) -> bool {
+    match (before, after) {
+        (Some(before), Some(after)) => !before.equivalent(after),
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 /// Turn the server's op-log stream into wake-ups for the pull loop.
@@ -840,7 +1091,10 @@ fn advance_watermark(previous: i64, applied: &[i64]) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{advance_watermark, baseline_excluding};
+    use super::{
+        advance_watermark, baseline_excluding, changed_since_snapshot, local_changes,
+        pull_conflicts,
+    };
     use omni_core::{Change, ChunkRef, FileMeta, Ignore, Manifest, changes};
 
     fn meta(label: &str) -> FileMeta {
@@ -850,6 +1104,185 @@ mod tests {
             mode: 0,
             chunks: vec![ChunkRef::new(label, 3)],
         }
+    }
+
+    fn test_engine(root: &std::path::Path) -> super::Engine {
+        super::Engine::new(
+            // apply_entries never contacts this address for the test cases:
+            // conflicts are preserved, and empty files need no chunks.
+            omni_transfer::Client::new("http://127.0.0.1:1").unwrap(),
+            omni_store::Store::open_agent_in_memory().unwrap(),
+            super::EngineConfig::new("folder", root),
+        )
+    }
+
+    fn incoming(
+        seq: i64,
+        bytes: &[u8],
+        kind: omni_netproto::OpKindDto,
+    ) -> omni_netproto::LogEntryDto {
+        omni_netproto::LogEntryDto {
+            seq,
+            version_id: seq,
+            kind,
+            path: omni_netproto::encode_path(b"note"),
+            device_id: "peer".into(),
+            size: bytes.len() as u64,
+            mtime_ns: 0,
+            mode: 0,
+            chunks: if bytes.is_empty() {
+                vec![]
+            } else {
+                vec![omni_netproto::ChunkRefDto {
+                    hash: omni_chunk::hash_hex(bytes),
+                    len: bytes.len() as u64,
+                }]
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn first_sync_conflict_survives_all_historical_operations() {
+        use omni_netproto::OpKindDto::{Delete, Put};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note"), b"unique local content").unwrap();
+        let engine = test_engine(root.path());
+        engine
+            .apply_entries(
+                vec![
+                    incoming(1, b"older remote", Put),
+                    incoming(2, b"unique local content", Put),
+                    incoming(3, b"", Delete),
+                ],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("note")).unwrap(),
+            b"unique local content"
+        );
+        assert_eq!(
+            engine
+                .store
+                .with(|c| omni_store::agent::applied_seq(c, "folder"))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            engine
+                .store
+                .with(|c| omni_store::agent::versions(c, "folder"))
+                .unwrap()
+                .get(b"note".as_slice()),
+            Some(&0)
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_delete_preserves_untracked_local_content() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note"), b"local").unwrap();
+        let engine = test_engine(root.path());
+        engine
+            .apply_entries(
+                vec![incoming(1, b"", omni_netproto::OpKindDto::Delete)],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root.path().join("note")).unwrap(), b"local");
+    }
+
+    #[tokio::test]
+    async fn clean_file_accepts_remote_replacement_but_local_deletion_is_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note"), b"old clean content").unwrap();
+        let engine = test_engine(root.path());
+        let baseline = engine.local_snapshot(b"note").unwrap().unwrap();
+        engine
+            .store
+            .with(|c| omni_store::agent::set_file(c, "folder", b"note", &baseline, 1))
+            .unwrap();
+        engine
+            .apply_entries(
+                vec![incoming(2, b"", omni_netproto::OpKindDto::Put)],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(root.path().join("note")).unwrap(), b"");
+        std::fs::remove_file(root.path().join("note")).unwrap();
+        engine
+            .apply_entries(
+                vec![incoming(
+                    3,
+                    b"remote replacement",
+                    omni_netproto::OpKindDto::Put,
+                )],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!root.path().join("note").exists());
+    }
+
+    #[test]
+    fn synthetic_conflicts_are_pushed_even_when_content_becomes_equivalent() {
+        let mut last = Manifest::new();
+        last.insert(b"note".to_vec(), meta("a"));
+        let versions = [(b"note".to_vec(), 0)].into_iter().collect();
+        assert!(matches!(
+            local_changes(&last, &last, &versions).as_slice(),
+            [Change::Put { .. }]
+        ));
+        assert!(matches!(
+            local_changes(&last, &Manifest::new(), &versions).as_slice(),
+            [Change::Delete { .. }]
+        ));
+        // An excluded baseline is invisible even when its old version is zero.
+        assert!(local_changes(&Manifest::new(), &Manifest::new(), &versions).is_empty());
+    }
+
+    #[tokio::test]
+    async fn matching_the_final_remote_head_is_adopted_without_an_overwrite() {
+        use omni_netproto::OpKindDto::Put;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("note"), b"current head").unwrap();
+        let engine = test_engine(root.path());
+        engine
+            .apply_entries(
+                vec![
+                    incoming(1, b"older version", Put),
+                    incoming(2, b"current head", Put),
+                ],
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        let latest = [(b"note".to_vec(), (2, Put))].into_iter().collect();
+        engine.adopt_equivalent_conflicts(&latest).await.unwrap();
+        assert_eq!(
+            engine
+                .store
+                .with(|c| omni_store::agent::versions(c, "folder"))
+                .unwrap()
+                .get(b"note".as_slice()),
+            Some(&2)
+        );
+    }
+
+    #[test]
+    fn touching_a_file_during_fetch_is_not_a_content_conflict() {
+        let before = meta("same");
+        let mut after = before.clone();
+        after.mtime_ns += 100;
+        assert!(!changed_since_snapshot(Some(&before), Some(&after)));
     }
 
     #[test]
@@ -907,5 +1340,41 @@ mod tests {
     #[test]
     fn an_empty_batch_leaves_the_watermark_alone() {
         assert_eq!(advance_watermark(42, &[]), 42);
+    }
+
+    #[test]
+    fn pull_guard_compares_with_local_baseline_not_incoming_remote() {
+        let clean = meta("base");
+        let remote_update = meta("remote");
+        assert!(!pull_conflicts(Some(&clean), Some(&clean)));
+        assert!(pull_conflicts(Some(&clean), Some(&remote_update)));
+        assert!(
+            pull_conflicts(Some(&clean), None),
+            "local deletion is dirty"
+        );
+        assert!(
+            pull_conflicts(None, Some(&remote_update)),
+            "untracked local put is dirty"
+        );
+        assert!(
+            !pull_conflicts(None, None),
+            "absent path can accept a remote put/delete"
+        );
+    }
+
+    #[test]
+    fn local_snapshot_detects_edit_and_deletion_during_fetch() {
+        let before = Some(meta("base"));
+        assert!(changed_since_snapshot(
+            before.as_ref(),
+            Some(&meta("edited"))
+        ));
+        assert!(changed_since_snapshot(before.as_ref(), None));
+        assert!(!changed_since_snapshot(
+            before.as_ref(),
+            Some(&meta("base"))
+        ));
+        assert!(changed_since_snapshot(None, Some(&meta("new local put"))));
+        assert!(!changed_since_snapshot(None, None));
     }
 }

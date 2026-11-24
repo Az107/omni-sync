@@ -14,11 +14,13 @@
 mod ignore;
 mod manifest;
 mod op;
+mod path;
 mod sequencer;
 mod version;
 
 pub use ignore::{Ignore, VAULT_EXCLUDES};
 pub use manifest::{Change, FileMeta, Manifest, changes};
 pub use op::{ChunkRef, Op, OpKind};
+pub use path::{InvalidPath, validate_relative_path};
 pub use sequencer::{Decision, Sequencer};
 pub use version::{PathBytes, Version};

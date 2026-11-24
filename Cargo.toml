@@ -6,7 +6,7 @@ members = ["crates/*"]
 # The shared *library* version (omni-core, -chunk, -netproto, -store, -transfer,
 # -agent, -update). The two binaries carry their own `version` in their crate
 # manifests and release independently on `client-v*` / `server-v*` tags.
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
@@ -14,13 +14,13 @@ repository = "https://github.com/Az107/omni-sync"
 
 [workspace.dependencies]
 # Internal crates.
-omni-agent = { path = "crates/omni-agent", version = "0.4.1" }
-omni-chunk = { path = "crates/omni-chunk", version = "0.4.1" }
-omni-core = { path = "crates/omni-core", version = "0.4.1" }
-omni-netproto = { path = "crates/omni-netproto", version = "0.4.1" }
-omni-store = { path = "crates/omni-store", version = "0.4.1" }
-omni-transfer = { path = "crates/omni-transfer", version = "0.4.1" }
-omni-update = { path = "crates/omni-update", version = "0.4.1" }
+omni-agent = { path = "crates/omni-agent", version = "0.4.2" }
+omni-chunk = { path = "crates/omni-chunk", version = "0.4.2" }
+omni-core = { path = "crates/omni-core", version = "0.4.2" }
+omni-netproto = { path = "crates/omni-netproto", version = "0.4.2" }
+omni-store = { path = "crates/omni-store", version = "0.4.2" }
+omni-transfer = { path = "crates/omni-transfer", version = "0.4.2" }
+omni-update = { path = "crates/omni-update", version = "0.4.2" }
 
 # External. Versions are the ones the `imp` workspace already builds on this
 # host, so most are warm in the registry cache.
@@ -68,6 +68,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "v7"] }
+url = "2.5"
 
 [profile.release]
 lto = "thin"
