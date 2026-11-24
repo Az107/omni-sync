@@ -42,6 +42,10 @@ design work. Native macOS/Windows tests run in CI alongside Linux.
 smoke test also verifies binary create/edit/delete, offline-edit convergence,
 control handoff, concurrent-daemon refusal, and shutdown with an idle control
 connection. Client `0.4.2` / server `0.4.1` retain protocol version `1`.
+Both component releases are published and the server is deployed at
+`https://sync.albruiz.dev/`. Native Linux/macOS/Windows CI and public two-client
+sync/rollback passed. Pre-upgrade data and volumes were preserved; see
+[`docs/releases/2026-11-24-verification.md`](docs/releases/2026-11-24-verification.md).
 
 **Folder policy (migration `0003`)** added server-side excludes and a
 permission policy, shared by every client of a folder. An Obsidian client
@@ -114,7 +118,9 @@ long as no DTO/endpoint changed. Rule of thumb for either component:
 
 **Transition note.** A client built before component tags (≤ 0.4.1) follows
 GitHub's repo-wide `latest` and cannot parse a `client-v*` tag, so once the
-first component-tagged client ships its auto-update will error. Update those
+first component-tagged client ships it cannot discover that upgrade. Component
+releases leave the legacy repo-wide `latest` unchanged, so old clients may
+report up to date; explicitly requesting a component tag errors. Update those
 devices **once by hand** — download the release asset for their target or
 reinstall — after which self-update works off the tag prefix. The server has no
 other known installed base, but the deployed 0.4.0 container has the same legacy

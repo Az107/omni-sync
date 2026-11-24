@@ -70,7 +70,7 @@ platform uses the compose stack.
 
 ## Updating the server binary from GitHub
 
-**First component-tagged upgrade:** the currently deployed 0.4.0 updater
+**First component-tagged upgrade:** the legacy 0.4.0 updater
 cannot parse `server-v*` tags, even with `--to`. Manually download and verify
 the ARM64 release binary, back up state and the running executable, then
 atomically stage it at `/state/bin/omni-sync-server` in the existing container.
@@ -203,6 +203,35 @@ first deploy.
 
 ## Status
 
+### 2026-11-24: server 0.4.1 deployed; client 0.4.2 released
+
+Both `server-v0.4.1` and `client-v0.4.2` are published. The server was
+manually bootstrapped from 0.4.0 using the checksum-verified ARM64 binary,
+then restarted in its existing container. Both original volume mappings
+were unchanged; all 354 existing operation/version rows were preserved.
+The deployed updater now understands component tags and reports up to date.
+
+A consistent SQLite online backup plus all 452 hash-verified immutable chunks
+and the old executable are retained under
+`/home/services/.local/state/omni-sync/backups/`. This method is safe here
+because chunks are immutable and no GC runs: snapshot the database first,
+then copy and verify every chunk it names. If chunk GC is introduced, this
+backup procedure must gain exclusion/snapshot coordination or stop the server.
+
+Public health reports `0.4.1`; dashboard login, pairing, two released client
+daemons, binary create/edit/delete, history and rollback passed. Acceptance
+used a separate folder; its test file is deleted and both test devices are
+revoked. The original four active devices remain active. See the
+[verification record](../../docs/releases/2026-11-24-verification.md).
+
+Cloudflare rejects Python's default urllib user agent with 403 on this
+domain. Use `curl` or a descriptive `User-Agent: omni-sync-release-validation`
+for scripted public checks; compare direct published-port health and PID 1's
+binary version before diagnosing an application startup failure. The initial
+checker safely rolled back until this edge-filter issue was identified.
+
+### Historical deployment notes (0.4.0 / client 0.4.1)
+
 **0.4.0 verified from the outside.**
 
 **Client 0.4.1 shipped; the server stays at 0.4.0 on purpose.** 0.4.1 is a
@@ -214,8 +243,8 @@ accurate.
 The client and server now version and release independently (`client-v*` /
 `server-v*` tags, see `AGENTS.md`). The `v0.4.1` release predates that split and
 still bundles a `omni-sync-server-0.4.1-*` asset; the server's own version is
-`0.4.0` in that release. The next prepared server release is `server-v0.4.1`;
-it has not been deployed merely because its manifest version was bumped.
+`0.4.0` in that legacy release. The later `server-v0.4.1` deployment is
+recorded above; a manifest version alone is not proof of deployment.
 
 **One-time client update.** Devices on ≤ 0.4.1 use the pre-split updater, which
 cannot read a `client-v*` tag; they need a manual binary swap once (download the

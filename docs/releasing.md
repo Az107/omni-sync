@@ -55,12 +55,16 @@ running binary, and take a consistent database/chunk-store backup. A short
 server stop while snapshotting both volumes is the simplest consistent
 backup; treat its contents as secrets. Verify the backup before proceeding.
 
-The deployed 0.4.0 server's legacy updater cannot parse `server-v*` tags,
+The old 0.4.0 server's legacy updater cannot parse `server-v*` tags,
 including explicit `--to` requests. Bootstrap this first upgrade manually:
 download the ARM64 bare binary and `SHA256SUMS`, verify the exact checksum,
 copy to a unique staging name on `/state/bin`, chmod executable, and rename
 over the staged server only after retaining its previous binary. Do not use
 the old updater for this transition.
+
+This one-time bootstrap completed on 2026-11-24; production now runs 0.4.1.
+See the [verification record](releases/2026-11-24-verification.md). Subsequent
+component-aware upgrades can use the server's normal download-only updater.
 
 Stage the published ARM64 binary on the **existing** `/state` volume and
 restart the existing container. Do not rebuild/redeploy with `se apps update`.

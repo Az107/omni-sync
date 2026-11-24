@@ -23,9 +23,12 @@ release gate, not something Linux results can establish. See
 [`docs/hardening.md`](docs/hardening.md) for the trust model and remaining
 design work, and [`docs/releasing.md`](docs/releasing.md) for release gates.
 
-**Release preparation:** libraries/client `0.4.2`, server `0.4.1`, protocol
-`1`. These are manifest versions, not a claim that component-tagged
-releases have been published or deployed.
+**Released and verified (2026-11-24):** libraries/client `0.4.2`, server
+`0.4.1`, protocol `1`. Both component-tagged releases are published; the
+server runs at `https://sync.albruiz.dev/` on its original volumes. Native
+Linux/macOS/Windows CI, released-binary smoke tests, an isolated client
+upgrade and public two-client sync/rollback checks passed. See the
+[release verification record](docs/releases/2026-11-24-verification.md).
 
 **M5 leftovers:** durable submission deduplication, bounded-memory file
 streaming, administrator-controlled folder authorization, integrity and
