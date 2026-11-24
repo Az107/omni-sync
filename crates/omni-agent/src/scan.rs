@@ -255,7 +255,21 @@ pub fn path_bytes(path: &Path) -> PathBytes {
 
 #[cfg(not(unix))]
 pub fn path_bytes(path: &Path) -> PathBytes {
-    path.to_string_lossy().into_owned().into_bytes()
+    // Windows joins native paths with `\`, but wire paths always use `/`.
+    // Preserve the native encoding instead of replacing unpaired UTF-16
+    // surrogates with U+FFFD: validation must reject an unrepresentable name,
+    // never silently alias it to a different file.
+    path.as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .map(|&byte| {
+            if cfg!(windows) && byte == b'\\' {
+                b'/'
+            } else {
+                byte
+            }
+        })
+        .collect()
 }
 
 /// Raw relative bytes back to a path under `root`.
@@ -304,6 +318,24 @@ mod tests {
             ignore: ignore.clone(),
             preserve_permissions,
         }
+    }
+
+    #[test]
+    fn native_nested_paths_use_wire_separators_without_losing_unicode() {
+        let native = Path::new("nested").join("résumé.md");
+        let bytes = path_bytes(&native);
+        assert_eq!(bytes, "nested/résumé.md".as_bytes());
+        assert_eq!(apply::validate_rel(&bytes).unwrap(), native);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unpaired_utf16_names_are_rejected_not_renamed_lossily() {
+        use std::os::windows::ffi::OsStringExt as _;
+        let name = std::ffi::OsString::from_wide(&[0xd800]);
+        let bytes = path_bytes(Path::new(&name));
+        assert_ne!(bytes, "�".as_bytes());
+        assert!(apply::validate_rel(&bytes).is_err());
     }
 
     #[cfg(unix)]

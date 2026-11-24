@@ -9,6 +9,8 @@ Both components retain protocol version 1. They release independently as
   remote paths again on the client and preserve local edits during replay.
 - Drain bounded historical operation pages before the first push and adopt
   matching existing files without generating false overwrites.
+- Encode Windows native path separators as wire `/` separators, preserving
+  Unicode and rejecting unrepresentable names rather than renaming them.
 - Share an OS ownership lock between daemons and one-shot client engines.
 - Validate submitted batches atomically, including chunk availability and
   lengths, and prevent cross-folder restore references.

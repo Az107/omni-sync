@@ -38,7 +38,7 @@ attempts. Daemons and one-shot engines share an OS ownership lock; control,
 HTTP, and SSE I/O have size limits/deadlines. See
 [`docs/hardening.md`](docs/hardening.md) for trust assumptions and remaining
 design work. Native macOS/Windows tests run in CI alongside Linux.
-184 workspace tests and strict clippy pass on Linux; an isolated two-daemon
+185 workspace tests and strict clippy pass on Linux; an isolated two-daemon
 smoke test also verifies binary create/edit/delete, offline-edit convergence,
 control handoff, concurrent-daemon refusal, and shutdown with an idle control
 connection. Client `0.4.2` / server `0.4.1` retain protocol version `1`.

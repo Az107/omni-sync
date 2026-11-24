@@ -18,7 +18,7 @@ iOS/Android testing and generated DTOs remain open.
 The current hardening pass adds capability-relative filesystem access,
 local-conflict preservation, atomic batch validation, bounded I/O,
 exclusive client ownership, session expiry and authentication limits.
-184 Rust workspace tests pass on Linux; native macOS/Windows CI is a
+185 Rust workspace tests pass on Linux; native macOS/Windows CI is a
 release gate, not something Linux results can establish. See
 [`docs/hardening.md`](docs/hardening.md) for the trust model and remaining
 design work, and [`docs/releasing.md`](docs/releasing.md) for release gates.
