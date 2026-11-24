@@ -15,6 +15,8 @@ Both components retain protocol version 1. They release independently as
 - Parse enrollment callbacks as URLs, harden dashboard redirects, expire
   sessions server-side, and bound authentication attempts and password work.
 - Bound control/HTTP/SSE I/O and harden atomic binary installation.
+- Update rustls to 0.23.46, which fixes the four reported upstream security
+  advisories affecting the previously locked 0.23.45 release.
 - Include shared folder policy, paged APIs, deleted-file recovery and device
   management from the previously unreleased Obsidian interoperability work.
 
