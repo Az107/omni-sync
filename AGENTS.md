@@ -29,6 +29,20 @@ both devices producing one overwrite row with last-write-wins convergence,
 and rolling back a file via both the dashboard and `omni-sync resolve`.
 91 unit tests, clippy `-D warnings` clean.
 
+**Hardening pass:** receiving clients use directory capabilities for apply and
+incoming reads, preserve local conflicts throughout historical replay, and
+drain bounded op pages before first push. The server validates and commits
+batches atomically, checks chunk availability/lengths, parses enrollment
+callbacks as URLs, expires dashboard sessions server-side, and bounds auth
+attempts. Daemons and one-shot engines share an OS ownership lock; control,
+HTTP, and SSE I/O have size limits/deadlines. See
+[`docs/hardening.md`](docs/hardening.md) for trust assumptions and remaining
+design work. Native macOS/Windows tests run in CI alongside Linux.
+184 workspace tests and strict clippy pass on Linux; an isolated two-daemon
+smoke test also verifies binary create/edit/delete, offline-edit convergence,
+control handoff, concurrent-daemon refusal, and shutdown with an idle control
+connection. Client `0.4.2` / server `0.4.1` retain protocol version `1`.
+
 **Folder policy (migration `0003`)** added server-side excludes and a
 permission policy, shared by every client of a folder. An Obsidian client
 (separate repo, `docs/obsidian-plugin-plan.md`) is built: folder policy,
@@ -103,7 +117,9 @@ GitHub's repo-wide `latest` and cannot parse a `client-v*` tag, so once the
 first component-tagged client ships its auto-update will error. Update those
 devices **once by hand** — download the release asset for their target or
 reinstall — after which self-update works off the tag prefix. The server has no
-installed base yet, so it moves straight to `server-v*`.
+other known installed base, but the deployed 0.4.0 container has the same legacy
+parser and needs a manual checksum-verified binary stage once; even `--to`
+cannot make that old parser accept `server-v*`. See `docs/releasing.md`.
 
 ## Commands
 
@@ -141,6 +157,13 @@ and release-builds both binaries on every push and PR; `release.yml`
 attaches a component to a GitHub release when a **`client-v*`** or
 **`server-v*`** tag is pushed (or via **Run workflow**), and only builds that
 component's targets. Both pin Rust 1.89.0 to match `rust-toolchain.toml`.
+
+Release gates and rollout are documented in [`docs/releasing.md`](docs/releasing.md).
+`scripts/release.py` checks tag/manifest agreement and the complete asset set;
+the workflow checks out the exact requested tag, verifies native binary versions,
+and validates downloaded draft assets before publication. Published releases
+are immutable. `python3 scripts/smoke.py` runs the isolated Linux socket smoke
+test after building both debug binaries (also a separate CI job).
 
 Release matrix — the client ships for six targets, the server for two:
 
@@ -416,7 +439,8 @@ edits.
   deliberate edit to the fixture generators, never an accident.
 - **The op log is paged, and a first sync is manifest-seeded.** `GET /ops`
   takes an optional `limit` and returns `next` + `has_more`; **without**
-  `limit` it returns the whole tail, which is what the Rust client uses.
+  `limit` it returns the whole tail for older clients. The Rust daemon requests
+  bounded pages and drains the historical tail before its first push.
   The Obsidian client reads `GET /head` *before* `/manifest`, adopts or
   downloads what the manifest lists, and sets `applied_seq` to the head
   instead of replaying history. Head-first is what makes an op that lands
@@ -424,6 +448,26 @@ edits.
 
 ## Invariants that must not be relaxed
 
+- **Remote paths are untrusted even after enrollment.** Validate raw relative
+  paths at the server and again before any client disk access. Filesystem apply
+  must remain relative to an opened directory capability; checking a path and
+  then using an ambient `root.join(path)` is vulnerable to symlink swaps.
+  Temp files must be exclusively created and end in `.omni-tmp` so the watcher
+  and scan never re-ingest them.
+- **Protect local conflicts for the whole pull, not just the first op.** A
+  synthetic version-zero baseline must survive subsequent historical puts and
+  deletes until push preserves the local content on the server. A pre-apply
+  dirty check compares disk to the *local baseline/snapshot*, not to incoming
+  remote content: comparing to remote content rejects every legitimate remote
+  update and creates an upload loop.
+- **Daemon ownership is an OS lock, not a control-file existence check.**
+  Acquire ownership before starting engines, and hold it throughout one-shot
+  engine operations too. Never unlink a lock file during normal release: a
+  second process may already hold its inode.
+- **Validate an entire submitted batch before committing any of it.** The
+  server must not mint active versions for unavailable chunks, invalid paths,
+  or inconsistent lengths. Atomic acceptance is not retry deduplication; lost
+  successful responses still need operation IDs for exactly-once semantics.
 - **The server is the only sequencer.** `omni_core::Sequencer::decide`
   is the single ordering rule; no device clock may order versions.
 - **Last-write-wins never deletes history.** A superseded version is kept
@@ -475,7 +519,8 @@ container's volumes); if `se apps update` is unavoidable, carry the old
 volumes across by hand. See the deploy README.
 
 **Deployed and verified from the outside** at
-`https://elevator.albruiz.dev/app/omni-sync/` — health, login, pairing,
+`https://sync.albruiz.dev/` (current attached domain; the former
+`https://elevator.albruiz.dev/app/omni-sync/` route now returns 404) — health, login, pairing,
 static assets, and a real client enrolling and syncing a file over the
 public URL.
 

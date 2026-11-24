@@ -6,9 +6,11 @@ Automatic file sync between devices: an always-on **server** with a
 dashboard (devices, folders, version history, overwrites) and a watching
 **client** daemon per device.
 
-The full design lives in [`plan.md`](plan.md). This repository is the M0
-scaffold: a compiling Rust workspace with the pure sync core, the
-chunkers, both database schemas, and the server/client binary shells.
+The full design lives in [`plan.md`](plan.md). The server and watching
+clients support bidirectional sync, version history, rollback, shared
+folder policies, and live/on-close sync modes. See
+[`docs/hardening.md`](docs/hardening.md) for security boundaries and deployment
+limitations.
 
 ## Layout
 
@@ -35,13 +37,13 @@ on this host is older, so use `+1.89.0` (or rely on `rust-toolchain.toml`).
 
 ## Releases
 
-Tagging `v*` (or running the **Release** workflow manually with a tag)
-builds and attaches prebuilt binaries, each with a `SHA256SUMS`:
+The client and server release independently on `client-v*` and `server-v*`
+tags (or through the **Release** workflow), with `SHA256SUMS`:
 
 | package | targets |
 |---|---|
-| `omni-sync` (client) | linux `x86_64`, macOS `arm64` + `x86_64`, Windows `arm64` + `x86_64` |
-| `omni-sync-server` | linux `x86_64` (also ships as a container) |
+| `omni-sync` (client) | linux `arm64` + `x86_64`, macOS `arm64` + `x86_64`, Windows `arm64` + `x86_64` |
+| `omni-sync-server` | linux `arm64` + `x86_64` (also ships as a container) |
 
 macOS and Windows builds are `tar.gz` / `zip` respectively. The macOS
 `x86_64` and Windows `arm64` builds are cross-compiled, so they are not

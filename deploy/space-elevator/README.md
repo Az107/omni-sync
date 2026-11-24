@@ -3,7 +3,10 @@
 The server runs as a container on a managed named volume, routed by
 space-elevator's Traefik at:
 
-**https://elevator.albruiz.dev/app/omni-sync/** (path prefix stripped).
+**https://sync.albruiz.dev/**. Confirmed with `se domain list` and public
+health on 2026-11-24. The former
+`https://elevator.albruiz.dev/app/omni-sync/` route now returns 404;
+sub-path base URLs remain supported by the client.
 
 ## Two things that matter
 
@@ -56,7 +59,7 @@ sg service-admin -c "se apps upload /tmp/omni-sync-se --kind custom --name omni-
   --secret OMNI_SYNC_PASSWORD='<password>'"
 ```
 
-Update an existing app (rebuilds, preserves volumes):
+Image rebuild only (**does not preserve volumes** on this host; see below):
 
 ```sh
 sg service-admin -c 'se apps update omni-sync --archive /tmp/omni-sync-se --yes'
@@ -66,6 +69,13 @@ sg service-admin -c 'se apps update omni-sync --archive /tmp/omni-sync-se --yes'
 platform uses the compose stack.
 
 ## Updating the server binary from GitHub
+
+**First component-tagged upgrade:** the currently deployed 0.4.0 updater
+cannot parse `server-v*` tags, even with `--to`. Manually download and verify
+the ARM64 release binary, back up state and the running executable, then
+atomically stage it at `/state/bin/omni-sync-server` in the existing container.
+See [`docs/releasing.md`](../../docs/releasing.md). The commands below apply
+after this bootstrap, when the running updater understands component tags.
 
 The container's `docker-entrypoint.sh` prefers a binary on the `/state`
 volume. To move to a published release without rebuilding the image:
@@ -79,7 +89,8 @@ omni-sync-server update --download-only /state/bin
 sg service-admin -c 'se apps restart omni-sync'
 ```
 
-`update` downloads the release asset for `x86_64-unknown-linux-gnu`,
+`update` downloads the release asset for the binary's compiled target (this
+host is `aarch64-unknown-linux-gnu`),
 verifies it against the release's `SHA256SUMS`, and writes it to
 `/state/bin/omni-sync-server` (executable). The staged binary survives
 redeploys because `/state` is a managed volume; delete it to return to
@@ -93,17 +104,27 @@ when the host environment has it).
 ## Verify from the outside
 
 ```sh
-curl -sS https://elevator.albruiz.dev/app/omni-sync/healthz          # {"ok":true,...}
-curl -sS -o /dev/null -w '%{http_code}\n' https://elevator.albruiz.dev/app/omni-sync/   # 303
+curl -sS https://sync.albruiz.dev/healthz          # {"ok":true,...}
+curl -sS -o /dev/null -w '%{http_code}\n' https://sync.albruiz.dev/   # 303
 ```
 
 Log in with `OMNI_SYNC_PASSWORD` and confirm the overview renders.
+
+For HTTPS session cookies, set `OMNI_SYNC_TRUST_FORWARDED_PROTO=1` in the
+app environment **after** confirming that the application listener cannot
+be reached directly, Traefik overwrites `X-Forwarded-Proto`, and it appends
+the verified client IP to `X-Forwarded-For`. Compose
+passes this setting through, defaulting to off. The server deliberately
+does not trust forwarding headers from arbitrary direct HTTP callers.
+Confirm the login response's `Set-Cookie` includes `Secure`, `HttpOnly`,
+and `SameSite=Strict`. Plain-HTTP local development can leave the setting
+off.
 
 ## Enroll clients
 
 ```sh
 # dashboard → devices → Add a device → copy the code
-omni-sync enroll --server https://elevator.albruiz.dev/app/omni-sync --code ABCD-EFGHJ
+omni-sync enroll --server https://sync.albruiz.dev --code ABCD-EFGHJ
 omni-sync folders
 omni-sync add <folder-id> ~/Documents/Shared
 omni-sync daemon
@@ -193,7 +214,8 @@ accurate.
 The client and server now version and release independently (`client-v*` /
 `server-v*` tags, see `AGENTS.md`). The `v0.4.1` release predates that split and
 still bundles a `omni-sync-server-0.4.1-*` asset; the server's own version is
-`0.4.0` in the manifest, and its next release will be tagged `server-v0.4.0`.
+`0.4.0` in that release. The next prepared server release is `server-v0.4.1`;
+it has not been deployed merely because its manifest version was bumped.
 
 **One-time client update.** Devices on ≤ 0.4.1 use the pre-split updater, which
 cannot read a `client-v*` tag; they need a manual binary swap once (download the

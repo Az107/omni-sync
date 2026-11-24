@@ -16,6 +16,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   TAG: ${{ inputs.tag || github.ref_name }}
@@ -36,36 +40,13 @@ jobs:
       version: ${{ steps.pick.outputs.version }}
       targets: ${{ steps.pick.outputs.targets }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - id: pick
         run: |
           set -euo pipefail
-          case "$TAG" in
-            client-v*) component=client; version="${TAG#client-v}" ;;
-            server-v*) component=server; version="${TAG#server-v}" ;;
-            *) echo "::error::tag '$TAG' must start with 'client-v' or 'server-v'"; exit 1 ;;
-          esac
-          if [ "$component" = client ]; then
-            targets='[
-              {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","package":"omni-cli","bin":"omni-sync","native":true},
-              {"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","package":"omni-cli","bin":"omni-sync","native":true},
-              {"os":"macos-latest","target":"aarch64-apple-darwin","package":"omni-cli","bin":"omni-sync","native":true},
-              {"os":"macos-latest","target":"x86_64-apple-darwin","package":"omni-cli","bin":"omni-sync","native":false},
-              {"os":"windows-latest","target":"aarch64-pc-windows-msvc","package":"omni-cli","bin":"omni-sync","native":false},
-              {"os":"windows-latest","target":"x86_64-pc-windows-msvc","package":"omni-cli","bin":"omni-sync","native":true}
-            ]'
-          else
-            targets='[
-              {"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","package":"omni-server","bin":"omni-sync-server","native":true},
-              {"os":"ubuntu-24.04-arm","target":"aarch64-unknown-linux-gnu","package":"omni-server","bin":"omni-sync-server","native":true}
-            ]'
-          fi
-          {
-            echo "component=$component"
-            echo "version=$version"
-            echo "targets<<TARGETS"
-            printf '%s\n' "$targets"
-            echo "TARGETS"
-          } >> "$GITHUB_OUTPUT"
+          python3 scripts/release.py "$TAG" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.bin }} ${{ matrix.target }}
@@ -77,6 +58,8 @@ jobs:
         include: ${{ fromJSON(needs.plan.outputs.targets) }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -92,15 +75,26 @@ jobs:
 
       - run: cargo build --release --locked -p ${{ matrix.package }} --target ${{ matrix.target }}
 
+      - name: Native regression tests
+        if: matrix.native
+        run: cargo test --workspace --locked
+
       # Cross-compiled targets (macOS x64, Windows arm64) cannot be executed
       # on the runner, so only the native ones are smoke-tested.
       - name: Smoke test (unix)
         if: matrix.native && runner.os != 'Windows'
-        run: ./target/${{ matrix.target }}/release/${{ matrix.bin }} --version
+        run: |
+          set -euo pipefail
+          actual=$(./target/${{ matrix.target }}/release/${{ matrix.bin }} --version)
+          test "$actual" = '${{ matrix.bin }} ${{ needs.plan.outputs.version }}'
 
       - name: Smoke test (windows)
         if: matrix.native && runner.os == 'Windows'
-        run: .\target\${{ matrix.target }}\release\${{ matrix.bin }}.exe --version
+        run: |
+          $actual = .\target\${{ matrix.target }}\release\${{ matrix.bin }}.exe --version
+          if ($LASTEXITCODE -ne 0 -or $actual -ne '${{ matrix.bin }} ${{ needs.plan.outputs.version }}') {
+            throw "Unexpected binary version: $actual"
+          }
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -140,27 +134,30 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ env.TAG }}
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
 
-      - name: Checksums
-        run: |
-          set -euo pipefail
-          cd dist
-          # Covers the bare self-updater binaries, the archives and the Windows
-          # zips. SHA256SUMS does not exist yet, so the glob cannot include it.
-          sha256sum * > SHA256SUMS
+      - name: Validate all assets and generate checksums
+        run: python3 scripts/release.py "$TAG" --dist dist
 
-      - name: Create or update the release
+      - name: Upload draft, verify downloaded assets, then publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            test "$draft" = true || { echo 'Refusing to overwrite a published release'; exit 1; }
             gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" --generate-notes
+              --verify-tag --draft --title "$TAG" --notes-file docs/releases/hardening.md
           fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir downloaded
+          python3 scripts/release.py "$TAG" --dist downloaded --verify-checksums
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest=false

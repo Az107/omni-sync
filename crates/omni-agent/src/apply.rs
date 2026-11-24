@@ -307,6 +307,22 @@ mod tests {
         assert!(remove_file(root.path(), b"missing/sub/file").is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn inbound_reads_and_deletes_cannot_follow_a_parent_outside_the_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("victim"), b"private").unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        assert!(open_file(root.path(), b"link/victim").is_err());
+        assert!(metadata(root.path(), b"link/victim").is_err());
+        assert!(remove_file(root.path(), b"link/victim").is_err());
+        assert_eq!(
+            std::fs::read(outside.path().join("victim")).unwrap(),
+            b"private"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_rejects_aliases_and_lossy_paths() {

@@ -33,10 +33,18 @@ jobs:
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Windows runners have no NASM installed; ignored on other targets.
+      AWS_LC_SYS_PREBUILT_NASM: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -82,6 +90,29 @@ jobs:
           path: target/release/${{ matrix.bin }}
           if-no-files-found: error
           retention-days: 14
+
+  smoke:
+    name: isolated two-daemon smoke
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke
+      - run: cargo build --locked -p omni-cli -p omni-server
+      - run: python3 scripts/smoke.py
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: smoke-logs
+          # Logs only: configs/databases contain credentials and file content.
+          path: /tmp/opencode/omni-release-smoke-*/*.log
+          retention-days: 7
 
   # The server's deploy path is the container, so a broken Dockerfile should
   # fail here rather than at `se apps update`.

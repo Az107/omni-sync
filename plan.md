@@ -5,28 +5,34 @@ code side (Rust workspace, edition 2024, Rust 1.89, crates with I/O at
 the edges) and `space-elevator` on the deploy side (VPS, Podman,
 Traefik + Let's Encrypt, systemd user unit).
 
-## Status (2026-10-10)
+## Status (2026-11-24)
 
-**M0–M4 done — the MVP syncs and is manageable.** A server and two
-daemons were run against each other: create (a text and a binary file,
-byte-identical on both sides), bidirectional edit, delete propagation,
-and an offline edit on both devices yielding exactly one overwrite row
-with last-write-wins converging both sides. The dashboard then restored
-the superseded version and both sides converged again. 47 tests, clippy
-clean. See `AGENTS.md` for entry points, the smoke test and the
-two-client verification recipe.
+**M0–M4 and M6 are built; M5 is partially complete.** Bidirectional
+event-driven sync, retained history/rollback, folder policy, paged replay,
+CLI `history`/`resolve`/`flush`, live/on-close modes, daemon service
+installation and restart-on-update are implemented. The server has been
+verified through the public HTTPS space-elevator deployment. The Obsidian
+client lives in a separate repository and is interop-tested, but physical
+iOS/Android testing and generated DTOs remain open.
 
-Still open: **M5** (client `history`/`resolve`/`flush` commands, chunk
-GC, membership enforcement, `notify`-driven wakeup, TLS deploy to the
-VPS).
+The current hardening pass adds capability-relative filesystem access,
+local-conflict preservation, atomic batch validation, bounded I/O,
+exclusive client ownership, session expiry and authentication limits.
+184 Rust workspace tests pass on Linux; native macOS/Windows CI is a
+release gate, not something Linux results can establish. See
+[`docs/hardening.md`](docs/hardening.md) for the trust model and remaining
+design work, and [`docs/releasing.md`](docs/releasing.md) for release gates.
 
-**M6 (onboarding + updates) is built** — see the M6 section below. The
-dashboard mints a magic link, `omni-sync enroll --link` opens a loopback
-listener and the browser hands it the code, `omni-sync add` is a wizard
-that lists the server's folders and completes paths, and both binaries
-ship `update`, which verifies a release against its `SHA256SUMS` before
-installing. Folder membership is now recorded (`members`) and shown on
-the dashboard; it is still not *enforced*.
+**Release preparation:** libraries/client `0.4.2`, server `0.4.1`, protocol
+`1`. These are manifest versions, not a claim that component-tagged
+releases have been published or deployed.
+
+**M5 leftovers:** durable submission deduplication, bounded-memory file
+streaming, administrator-controlled folder authorization, integrity and
+repair tools, quotas, retention enforcement and chunk garbage collection.
+Membership is recorded but does not restrict access. Signed releases and
+full-content verification are also pending. The design sections below
+describe intended behavior; they are not all implemented.
 
 ## Answers folded in (2026-10-10)
 
